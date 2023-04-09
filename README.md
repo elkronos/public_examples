@@ -11,3 +11,6 @@ The scripts contained in this repo have not been tested for _your_ productionize
 ## Inteded use
 
 I hope these scripts can serve as examples of different approaches.
+
+### Questions, suggestions, issues
+napoleonic_bores@proton.me
