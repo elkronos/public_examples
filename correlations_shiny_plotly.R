@@ -40,6 +40,8 @@ server <- function(input, output) {
       tagList(
         selectInput("x_var", "X Variable:", choices = intersect(names(data())[1], names(data()))),
         selectInput("y_var", "Y Variable:", choices = intersect(names(data())[2], names(data()))),
+        selectInput("x_var", "X Variable:", choices = names(data()), selected = names(data())[1]),
+        selectInput("y_var", "Y Variable:", choices = names(data()), selected = names(data())[2]),
         selectInput("facet_var", "Facet Variable:", c("", names(data())), selected = ""),
         checkboxInput("add_loess", "Add Loess Line", value = FALSE)
       )
