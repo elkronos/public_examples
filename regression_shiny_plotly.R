@@ -50,6 +50,7 @@ ui <- fluidPage(
     mainPanel(
       tabsetPanel(
         tabPanel("Scatterplot", plotlyOutput("scatterplot")),
+        tabPanel("Descriptive Stats", DT::dataTableOutput("desc_stats")),  # Add a new tabPanel for Descriptive Stats
         tabPanel("Results", DT::dataTableOutput("reg_table")),
         tabPanel("Summary", verbatimTextOutput("model_summary")),
         tabPanel("Assumptions", plotOutput("diagnostic"))
@@ -151,6 +152,13 @@ server <- function(input, output, session) {
     
     gg <- ggplotly(p)
     gg
+  })
+  
+  # Table
+  output$desc_stats <- DT::renderDataTable({   # Create a new output for Descriptive Stats
+    data() %>%
+      psych::describe() %>%
+      DT::datatable()
   })
   
   # Results
