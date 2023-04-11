@@ -2,7 +2,7 @@
 #' 
 #' This function creates facetted scatter plots using ggplot2. Each panel shows the scatter plot and a line of
 #' best fit for a subset of the data. The line of best fit is based on the specified family of models (default is 
-#' gaussian), and is computed using the lm() function. For the linear model, red indicates slopw is negative, blue is positive.
+#' gaussian), and is computed using the lm() function. For the linear model, red indicates slope is negative, blue is positive.
 #' 
 #' @param data A data frame containing the data to be plotted.
 #' @param x_var A character string indicating the name of the variable to be plotted on the x-axis.
