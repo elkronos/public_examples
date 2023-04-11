@@ -1,5 +1,18 @@
 # Hosted: https://jchase.shinyapps.io/correlations/
 # Git: https://github.com/elkronos/public_examples
+#
+## Code to construct a fake data set to upload into the dashboard
+## Set seed for reproducibility
+# set.seed(42)
+## Generate fake data
+# data <- tibble(
+#   group = factor(sample(c("A", "B", "C"), 100, replace = TRUE)),
+#   var1 = rnorm(100, mean = 5, sd = 2),
+#   var2 = rnorm(100, mean = 10, sd = 4) + var1,
+#   var3 = rnorm(100, mean = 20, sd = 6) - var2
+# )
+## Save the data to a CSV file
+# write.csv(data, "fake_example_data.csv", row.names = FALSE)
 
 # Load packages
 library(shiny)
@@ -10,6 +23,9 @@ library(BayesFactor)
 library(see)
 library(dplyr)
 library(lme4)
+library(readxl)
+library(readr)
+library(tidyr)
 
 # Define user input
 ui <- fluidPage(
