@@ -1,4 +1,4 @@
-#' stat_bar function
+#' Bar plot
 #' 
 #' This function creates a count bar plot if X is specified and Y is null. If Y has a variable, the user must specify what statistic they want for Y by every level of X.
 #'
@@ -30,16 +30,18 @@
 #' # Median price by cut without labels above bars
 #' stat_bar(diamonds, "cut", "price", "median", show_labels = F)
 #' 
+#' # Hide title
+#' stat_bar(diamonds, "cut", "price", "median", show_title = F)
+#' 
 #' }
 #' @export
-
 # Load packages
 library(ggplot2)
 library(dplyr)
 library(viridis)
 
 # Save function
-stat_bar <- function(data, x, y = NULL, stat_type = NULL, show_labels = TRUE, x_labels = NULL, y_labels = NULL) {
+stat_bar <- function(data, x, y = NULL, stat_type = NULL, show_labels = TRUE, x_labels = NULL, y_labels = NULL, show_title = TRUE) {
   stat_functions <- c("sum", "mean", "median", "min", "max")
   
   if (!is.null(stat_type) && !stat_type %in% stat_functions) {
@@ -81,6 +83,15 @@ stat_bar <- function(data, x, y = NULL, stat_type = NULL, show_labels = TRUE, x_
       plot <- plot +
         geom_text(data = data_stat, aes(label = y, x = !!sym(x), y = y), position = position_dodge(width = 0.9), vjust = -0.5)
     }
+  }
+  
+  if (show_title) {
+    if (is.null(y)) {
+      title <- "Count by " %>% paste0(to_title_case(x))
+    } else {
+      title <- to_title_case(stat_type) %>% paste0(" of ", to_title_case(y), " by ", to_title_case(x))
+    }
+    plot <- plot + ggtitle(title)
   }
   
   plot <- plot +
