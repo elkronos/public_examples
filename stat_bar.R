@@ -10,7 +10,7 @@
 #' @param show_labels A logical value indicating whether to display data labels on the bars. Default is TRUE.
 #' @param x_labels An optional character string for the x-axis label. Default is NULL, which will use the variable name.
 #' @param y_labels An optional character string for the y-axis label. Default is NULL, which will use the stat_type.
-#' @param color_palette An optional character vector representing a custom color palette. Default is NULL, which will use the viridis color scale.
+#' @param show_title An optional character vector representing the title. Default is Count of X or Stat of Y by X.
 #' @importFrom ggplot2 ggplot geom_bar scale_fill_manual aes theme_minimal element_text theme
 #' @importFrom dplyr group_by summarize
 #' @importFrom viridis viridis
