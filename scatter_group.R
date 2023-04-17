@@ -48,7 +48,7 @@ scatter_group <- function(data, x_var, y_var, categorical_var, facet_var = NULL,
   
   p <- ggplot(data, aes(x = !!sym(as_label(x_var)), y = !!sym(as_label(y_var)), color = !!sym(paste0("f_", as_label(categorical_var))))) +
     geom_point(size = 3, alpha = 0.7) +
-    geom_smooth(method = smooth_method, se = smooth_se, linetype = "dashed", size = 1) +
+    geom_smooth(method = smooth_method, se = smooth_se, linetype = "dashed", linewidth = 1) +
     xlab(as_label(x_var)) +
     ylab(as_label(y_var)) +
     ggtitle(paste("Scatter of", as_label(x_var), "vs", as_label(y_var),
