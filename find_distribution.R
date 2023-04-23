@@ -34,8 +34,6 @@ density_fun <- function(dist, x, params) {
     return(dbinom(x, size = params[1], prob = params[2]))
   } else if (dist == "exponential") {
     return(dexp(x, rate = params[1]))
-  } else if (dist == "geometric") {
-    return(dgeom(x, prob = params[1]))
   } else if (dist == "gamma") {
     return(dgamma(x, shape = params[1], rate = params[2]))
   } else if (dist == "log-normal") {
