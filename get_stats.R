@@ -5,7 +5,7 @@
 #' # LINE 104 - get_gis_stats() - centroid, distance, proximity, convex hull, greatest distance
 #' # LINE 149 - get_multi_stats() - nulls, percent not null, unique levels, highest value, lowest value, average length, max length, minimum length
 #' # LINE 234 - get_numeric_stats() - mean, median, mode, sample standard deviation, population standard deviation, kurtosis, skewness, sum, absolute sum
-#' # LINE 311 - get_numeric_stats() - mean, median, mode, sample standard deviation, population standard deviation, kurtosis, skewness, sum, absolute sum, minimum, max, number of nulls, percent of data not null (allows for grouping)
+#' # LINE 311 - get_science_stats() - mean, median, mode, sample standard deviation, population standard deviation, kurtosis, skewness, sum, absolute sum, minimum, max, number of nulls, percent of data not null (allows for grouping)
 #'
 #'
 # Load library
