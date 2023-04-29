@@ -125,3 +125,48 @@ vis_ids <- function(df_list) {
        vertex.color = "white", vertex.frame.color = "black", vertex.shape = "circle",
        edge.arrow.size = 0.5)
 }
+
+
+#' Clean variable names in a list of data frames
+#'
+#' This function cleans variable names in a list of data frames. It replaces spaces and non-alphanumeric characters with a specified separator (underscore by default) and converts the names to lowercase. The cleaned names are then assigned to the column names of each data frame.
+#'
+#' @param df_list A list of data frames to be cleaned.
+#' @param replace_non_alphanumeric A logical value indicating whether non-alphanumeric characters should be replaced. Default is TRUE.
+#' @param separator A character used to replace spaces and non-alphanumeric characters. Default is "_".
+#' @return A list of data frames with cleaned variable names.
+#' @importFrom utils gsub tolower
+#' @examples
+#' # Create example dataset
+#' df1 <- data.frame("ID" = 1:5, "Name" = c("John Smith", "Samantha Jones", "David Lee", "Emily Brown", "Tom Davis"), 
+#'                   "Age" = c(28, 35, 42, 29, 47), "Income (USD)" = c(50000, 75000, 90000, 62000, 85000))
+#' df2 <- data.frame("ID" = 6:10, "Name" = c("Mary Johnson", "Alex Kim", "Rachel Chen", "Adam Garcia", "Linda Wong"), 
+#'                   "Age" = c(32, 41, 26, 37, 49), "Income (USD)" = c(72000, 89000, 60000, 82000, 95000))
+#' df3 <- data.frame("ID" = 11:15, "Name" = c("Erica Martinez", "Peter Chen", "Alicia Ramirez", "Jake Kim", "Karen Lee"), 
+#'                   "Age" = c(45, 27, 33, 51, 39), "Income (USD)" = c(98000, 55000, 72000, 105000, 83000))
+#'
+#' # Combine into list
+#' df_list <- list(df1, df2, df3)
+#'
+#' # Clean variable names
+#' cleaned_df_list <- clean_varnames(df_list)
+#'
+#' # Print column names of first data frame
+#' colnames(cleaned_df_list[[1]])
+#'
+#' @export
+# Load clean_varnames function
+clean_varnames <- function(df_list, replace_non_alphanumeric = TRUE, separator = "_") {
+  stopifnot(is.list(df_list))
+  # Loop through each data frame in the list
+  for (i in seq_along(df_list)) {
+    # Clean variable names in each data frame
+    varnames <- gsub(" ", separator, tolower(gsub("\\s+", "", colnames(df_list[[i]]))))
+    if (replace_non_alphanumeric) {
+      varnames <- gsub("[^[:alnum:]]+", separator, varnames)
+    }
+    varnames <- gsub(paste0(separator, "+$"), "", varnames)
+    colnames(df_list[[i]]) <- varnames
+  }
+  return(df_list)
+}
