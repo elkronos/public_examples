@@ -17,7 +17,7 @@
 #' df2 <- data.frame(ID = 3:7, Age = c(25, 32, 46, 18, 57))
 #' df3 <- data.frame(ID = 2:6, Gender = c("M", "F", "M", "F", "M"))
 #' df_list <- list(df1, df2, df3)
-#' find_ids(df_list) # Returns a data frame
+#' find_ids(df_list) -> save_results # Returns a data frame
 # Load package
 library(dplyr)
 # Save function
@@ -169,4 +169,29 @@ clean_varnames <- function(df_list, replace_non_alphanumeric = TRUE, separator =
     colnames(df_list[[i]]) <- varnames
   }
   return(df_list)
+}
+
+#' Remove duplicate rows from a data frame
+#'
+#' This function removes duplicate rows from a data frame, keeping only the first occurrence of each duplicated row.
+#'
+#' @param df A data frame to remove duplicates from
+#' @return A data frame with duplicate rows removed, keeping only the first occurrence of each duplicated row
+#' @export
+#' @examples
+#' df <- data.frame(x = c(1, 2, 1), y = c("a", "b", "a"))
+#' remove_duplicates(df)
+#' #   x y
+#' # 1 1 a
+#' # 2 2 b
+#' 
+#' df <- data.frame(x = c(1, 2, 1), y = c("a", "b", "a"), z = c(3, 4, 3))
+#' remove_duplicates(df)
+#' #   x y z
+#' # 1 1 a 3
+#' # 2 2 b 4
+#'
+#' @import dplyr
+remove_duplicates <- function(df) {
+  dplyr::distinct(df, .keep_all = TRUE)
 }
