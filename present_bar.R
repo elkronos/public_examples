@@ -93,6 +93,3 @@ present_bar <- function(data, statistic = "mean", unique_levels = 10, custom_col
   # Save the PowerPoint object to a file
   print(pptx, target = "bar_plots.pptx")
 }
-
-
-create_bar_plots(diamonds, statistic = "mean", unique_levels = 10)
