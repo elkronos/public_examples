@@ -3,69 +3,79 @@ set.seed(3141) # for reproducibility
 # Q-learning update function
 update <- function(i, r) {
   Q[i] <<- Q[i] + 1/(k[i]+1) * (r-Q[i]) # Q-learning function
-  k[i] <<- k[i] + 1 # one more game played on the i'th bandit
+  k[i] <<- k[i] + 1 # one more game played on i'th bandit
 }
 
-# Simulate game on one-armed bandit i
+# simulate game on one-armed bandit i
 ret <- function(i) {
   round(rnorm(1, mean = rets[i]))
 }
 
-# Choose which bandit to play
+# chose which bandit to play
 which.bandit <- function() {
   p <- runif(1)
-  ifelse(p >= epsilon, which.max(Q), sample(1:n, 1))
+  Q <- predict.Q(1:n)
+  if (p >= epsilon) {
+    return(which.max(Q))
+  } else {
+    return(sample(1:n, 1))
+  }
 }
 
 epsilon <- 0.1 # switch in epsilon percent of cases
 rets <- c(4, 5, 4, 4, 4) # average returns of bandits
 n <- length(rets)
-Q <- rep(0, n) # initialize return vector
 k <- rep(0, n) # initialize vector for games played on each bandit
-N <- 1000 # number of runs
+N <- 1000 # no. of runs
 R <- 0 # sum of returns
 
+library(neuralnet)
+set.seed(271) # for reproducibility
+
+epsilon <- 0.1 # switch in epsilon percent of cases
+rets <- c(4, 5, 4, 4, 4) # average returns of bandits
+n <- length(rets)
+k <- rep(0, n) # initialize vector for games played on each bandit
+N <- 10000 # no. of runs
+R <- 0 # sum of returns
+
+# Neural network model
+nn <- neuralnet(Q ~ i, data = data.frame(i = 1:n, Q = rep(0, n)), hidden = c(100), linear.output = TRUE, lifesign = "none", algorithm = "rprop+")
+
+# Predict Q-values using the neural network
+predict.Q <- function(i) {
+  predict(nn, data.frame(i = i))
+}
+Q <- predict.Q(1:n) # initialize return vector
+
+# Update the neural network using backpropagation
+update <- function(i, r) {
+  y <- Q[i] + 1/(k[i]+1) * (r-Q[i]) # Q-learning function
+  k[i] <<- k[i] + 1 # one more game played on the i'th bandit
+  
+  # Update the neural network weights less frequently
+  if (j %% 10 == 0) {
+    nn <<- neuralnet(Q ~ i, data = data.frame(i = 1:n, Q = c(Q[-i], y)), hidden = c(50), linear.output = TRUE, startweights = nn$weights, lifesign = "none", algorithm = "rprop+")
+  }
+}
+
 for (j in 1:N) {
-  i <- which.bandit() # choose bandit
+  i <- which.bandit() # chose bandit
   r <- ret(i) # simulate bandit
   R <- R + r # add return of bandit to overall sum of returns
   update(i, r) # calling Q-learning update function
 }
 
-set.seed(1234) # for reproducibility, changed to 1234
+which.max(Q)
 
-# Load packages
-library(neuralnet)
-library(NeuralNetTools)
+k
 
-# Normalize the input data
-normalize <- function(x) {
-  return((x - min(x)) / (max(x) - min(x)))
-}
+N * max(rets)
 
-normalized_i <- normalize(1:n)
-normalized_Q <- normalize(Q)
+R
 
-# Train the neural network with the normalized data
-nn <- neuralnet(Q ~ i, data = data.frame(i = normalized_i, Q = normalized_Q), hidden = c(25, 25, 25), linear.output = TRUE, lifesign = "none", algorithm = "rprop+")
+R / (N * max(rets))
 
-# Compute predictions
-predictions <- compute(nn, data.frame(i = normalized_i))
+N * mean(rets) 
 
-predicted_Q <- predictions$net.result
-
-# Denormalize the predicted Q values
-denormalize <- function(x, original_data) {
-  return(x * (max(original_data) - min(original_data)) + min(original_data))
-}
-
-denormalized_predicted_Q <- denormalize(predicted_Q, Q)
-
-# Calculate evaluation metrics
-MAE <- mean(abs(denormalized_predicted_Q - Q))
-MSE <- mean((denormalized_predicted_Q - Q)^2)
-RMSE <- sqrt(MSE)
-
-cat("MAE:", MAE, "\n")
-cat("MSE:", MSE, "\n")
-cat("RMSE:", RMSE, "\n")
+(R - N * mean(rets)) / (N * mean(rets))
