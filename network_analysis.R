@@ -431,6 +431,6 @@ save_graph <- function(graph, file_name, format = "pdf") {
 #' 
 #' # Test save_graph function
 #' # Uncomment the following line to save the graph as a PDF
-#' # save_graph(graph, "synthetic_network.pdf")
+#' # save_graph(example_graph, "synthetic_network.pdf")
 #'
 #' @export
