@@ -6,7 +6,7 @@
 #' # LINE 163 - plot_degree_distribution() - Plot the degree distribution of nodes (asses peaks and distribution)
 #' # LINE 201 - compare_graphs() - Compare differences among two networks
 #' # LINE 260 - network_overlap() - Calculate overlap between two networks
-#' # LINE 302 - metrics() - Calculate measures of centrality as well as other KPIs (cluster, small worldness, etc)
+#' # LINE 302 - network_metrics() - Calculate measures of centrality as well as other KPIs (cluster, small worldness, etc)
 #' # LINE 355 - save_graph() - Save network plots
 #' 
 # Load libraries
@@ -299,7 +299,7 @@ network_overlap <- function(graph1, graph2) {
 #' @return A data frame containing the calculated centrality measures and other metrics.
 #'
 #' @import igraph
-metrics <- function(graph, normalize = TRUE, label_col = NULL) {
+network_metrics <- function(graph, normalize = TRUE, label_col = NULL) {
   if (is.null(graph) || vcount(graph) == 0 || ecount(graph) == 0) {
     cat("Cannot compute metrics for a NULL or empty graph.\n")
     return(NULL)
@@ -427,7 +427,7 @@ save_graph <- function(graph, file_name, format = "pdf") {
 #' overlap <- network_overlap(example_graph, example_graph2)
 #' 
 #' # Calculate network metrics
-#' metric_values <- metrics(example_graph)
+#' metric_values <- network_metrics(example_graph)
 #' 
 #' # Test save_graph function
 #' # Uncomment the following line to save the graph as a PDF
