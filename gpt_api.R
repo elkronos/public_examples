@@ -17,6 +17,8 @@
 #'     Default is NULL.
 #' @param num_retries Number of times to retry the request in case of failure. Default is 3.
 #' @param pause_base The number of seconds to wait between retries. Default is 1.
+#' @param presence_penalty The penalty for new tokens based on their presence in the input. Default is 0.0.
+#' @param frequency_penalty The penalty for new tokens based on their frequency in the input. Default is 0.0.
 #'
 #' @return A character string containing the generated text.
 #'
@@ -31,8 +33,14 @@ library(stringr)
 # Save API key
 api_key <- "sk-your-api-key-here" 
 # Function
+library(httr)
+library(stringr)
+# Save API key
+api_key <- "sk-your-api-key-here" 
+# Function
 gpt <- function(prompt, model = "gpt-3.5-turbo", temperature = 0.5, max_tokens = 50, 
-                system_message = NULL, num_retries = 3, pause_base = 1) {
+                system_message = NULL, num_retries = 3, pause_base = 1, 
+                presence_penalty = 0.0, frequency_penalty = 0.0) {
   messages <- list(list(role = "user", content = prompt))
   if (!is.null(system_message)) {
     # prepend system message to messages list
@@ -51,7 +59,9 @@ gpt <- function(prompt, model = "gpt-3.5-turbo", temperature = 0.5, max_tokens =
       model = model,
       temperature = temperature,
       max_tokens = max_tokens,
-      messages = messages
+      messages = messages,
+      presence_penalty = presence_penalty,
+      frequency_penalty = frequency_penalty
     )
   )
   
