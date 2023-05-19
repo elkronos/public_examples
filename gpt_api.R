@@ -93,3 +93,57 @@ count_tokens <- function(text) {
   # Return number of tokens
   return(length(tokens))
 }
+
+#' Estimate the cost based on input and output tokens
+#'
+#' This function calculates the estimated cost based on the number of input and output tokens and the specified model.
+#'
+#' @param input_tokens The number of input tokens.
+#' @param output_tokens The number of output tokens.
+#' @param model The model to use for estimation (default is "gpt-3.5-turbo").
+#'
+#' @return A list with the following elements:
+#'   \describe{
+#'     \item{input_tokens}{The number of input tokens.}
+#'     \item{output_tokens}{The number of output tokens.}
+#'     \item{input_cost}{The estimated cost for the input tokens.}
+#'     \item{output_cost}{The estimated cost for the output tokens.}
+#'     \item{total_cost}{The total estimated cost (input_cost + output_cost).}
+#'   }
+#'
+#' @examples
+#' input_tokens <- 1200
+#' output_tokens <- 800
+#' model <- "gpt-4"
+#'
+#' cost_estimate <- estimate_cost(input_tokens, output_tokens, model)
+#' print(paste("Input tokens:", cost_estimate$input_tokens))
+#' print(paste("Output tokens:", cost_estimate$output_tokens))
+#' print(paste("Input cost:", cost_estimate$input_cost))
+#' print(paste("Output cost:", cost_estimate$output_cost))
+#' print(paste("Total cost:", cost_estimate$total_cost))
+#'
+estimate_cost <- function(input_tokens, output_tokens, model = "gpt-3.5-turbo") {
+  
+  if (model == "gpt-4") {
+    price_1k_in <- ifelse(input_tokens <= 8000, 0.03, 0.06)
+    price_1k_out <- ifelse(output_tokens <= 8000, 0.06, 0.12)
+  } else {
+    price_1k_in <- 0.002
+    price_1k_out <- 0.002
+  }
+  
+  input_cost <- input_tokens / 1000 * price_1k_in
+  output_cost <- output_tokens / 1000 * price_1k_out
+  total_cost <- input_cost + output_cost
+  
+  result <- list(
+    input_tokens = input_tokens,
+    output_tokens = output_tokens,
+    input_cost = input_cost,
+    output_cost = output_cost,
+    total_cost = total_cost
+  )
+  
+  return(result)
+}
