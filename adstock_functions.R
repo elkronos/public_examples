@@ -405,6 +405,11 @@ adstock_grid_search_cv_walk_forward <- function(x, lags = seq(1, 20, by = 1), de
 #'   x_test <- x[(train_size + 1):length(x)]
 #'   
 #'   # Transform the training data with the optimal parameters
+#'   optimal_lag <- results_cv$optimal_lag
+#'   optimal_decay <- results_cv$optimal_decay
+#'   adstocked_train <- adstock_vectorized(x_train, optimal_lag, optimal_decay)
+#'   
+#'   # Transform the training data with the optimal parameters
 #'   adstocked_train <- adstock_vectorized(x_train, optimal_lag, optimal_decay)
 #'   
 #'   # Train the model and make predictions on the test set
