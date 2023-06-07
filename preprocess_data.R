@@ -75,7 +75,8 @@ library(ranger)
 #' @export
 preprocess_data <- function(data, outcome_var, partition_ratio = 0.7, date_vars = NULL,
                             outlier_multiplier = 1.5, interaction_degree = 2,
-                            custom_transform = NULL, feature_selection = TRUE, num_selected_features = 3){
+                            custom_transform = NULL, feature_selection = TRUE, num_selected_features = 3,
+                            ordinal_encoding = FALSE){
   
   if (!outcome_var %in% names(data)) {
     stop("outcome_var not found in data")
@@ -95,6 +96,18 @@ preprocess_data <- function(data, outcome_var, partition_ratio = 0.7, date_vars 
   
   if (!is.null(custom_transform) && !is.function(custom_transform)) {
     stop("custom_transform must be a function")
+  }
+  
+  if (ordinal_encoding && !is.factor(data[[outcome_var]])) {
+    stop("outcome_var must be a factor for ordinal encoding")
+  }
+  
+  # Apply ordinal encoding if necessary
+  if (ordinal_encoding) {
+    levels <- unique(data[[outcome_var]])
+    ordinal_levels <- 1:length(levels)
+    names(ordinal_levels) <- levels
+    data[[outcome_var]] <- ordinal_levels[data[[outcome_var]]]
   }
   
   # Partition data
@@ -177,7 +190,7 @@ preprocess_data <- function(data, outcome_var, partition_ratio = 0.7, date_vars 
     test <- custom_transform(test)
   }
   
-  # Feature selection
+  importance_table <- NULL
   if (feature_selection) {
     set.seed(123)
     rf_model <- ranger(outcome_var ~ ., data = train, importance = 'impurity')
@@ -188,5 +201,5 @@ preprocess_data <- function(data, outcome_var, partition_ratio = 0.7, date_vars 
     test <- test %>% select(all_of(c(outcome_var, top_features)))
   }
   
-  return(list(train = train, test = test))
+  return(list(train = train, test = test, importance_table = importance_table))
 }
