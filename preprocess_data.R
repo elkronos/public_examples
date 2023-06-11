@@ -219,3 +219,98 @@ preprocess_data <- function(data, outcome_var, partition_ratio = 0.7, date_vars 
   
   return(list(train = train, test = test, importance_table = importance_table))
 }
+
+#' Apply Preprocessing Transformations to Test Data
+#'
+#' This function applies a range of preprocessing transformations to a testing data set.
+#' The transformations are defined by the parameters that are generated from a previous preprocessing of the training data.
+#' This ensures that the same transformations are applied to both training and testing data.
+#'
+#' @param data The testing data frame on which the transformations are to be applied.
+#'
+#' @param preproc_params A list containing all the preprocessing parameters used on the training set. This includes:
+#'   \itemize{
+#'     \item \strong{scaler_params}: A list that includes 'center' and 'scale' parameters from the previous feature scaling step. These parameters are used to standardize numeric variables in the testing set.
+#'     \item \strong{imputer_params}: A MICE 'mids' object that contains the imputation model fitted on the training data. This is used to fill missing values in the testing set.
+#'     \item \strong{one_hot_encoder_params}: An object from caret's 'dummyVars' function or similar, which defines how to perform one-hot encoding on categorical variables in the testing set.
+#'     \item \strong{outlier_params}: A list with a named list for each numeric variable, where each named list contains the 'quantiles' and 'H' (IQR multiplier) used to identify and remove outliers in the testing data.
+#'     \item \strong{interaction_params}: A list with the 'degree' of the polynomial for creating interaction terms.
+#'     \item \strong{custom_transform}: A custom function for data transformation if any was applied to the training data.
+#'   }
+#'
+#' @return A data frame that has had all the specified transformations applied.
+#'
+#' @export
+#'
+#' @examples
+#' \dontrun{
+#' data(testdata)
+#' preproc_params <- list(scaler_params = list(center = TRUE, scale = TRUE),
+#'                        imputer_params = mice::mice(testdata, m = 5, method = 'pmm', seed = 500),
+#'                        one_hot_encoder_params = caret::dummyVars(~., data = testdata),
+#'                        outlier_params = lapply(testdata, function(x) list(quantiles = quantile(x, c(0.25, 0.75)), H = 1.5 * IQR(x))),
+#'                        interaction_params = list(degree = 2),
+#'                        custom_transform = NULL)
+#' transformed_data <- apply_transformations(testdata, preproc_params)
+#' }
+#' @export
+apply_transformations <- function(data, preproc_params){
+  
+  # Extract parameters
+  scaler_params <- preproc_params$scaler_params
+  imputer_params <- preproc_params$imputer_params
+  one_hot_encoder_params <- preproc_params$one_hot_encoder_params
+  outlier_params <- preproc_params$outlier_params
+  interaction_params <- preproc_params$interaction_params
+  custom_transform <- preproc_params$custom_transform
+  
+  # Check if data is a dataframe
+  if (!is.data.frame(data)) {
+    stop("data must be a dataframe")
+  }
+  
+  # Scale data
+  if (!is.null(scaler_params)) {
+    data[sapply(data, is.numeric)] <- Map(scale, data[sapply(data, is.numeric)], center = scaler_params$center, scale = scaler_params$scale)
+  }
+  
+  # Impute missing data
+  if (!is.null(imputer_params)) {
+    data <- mice::complete(imputer_params, newdata = data)
+  }
+  
+  # Apply one-hot encoding
+  if (!is.null(one_hot_encoder_params)) {
+    data <- predict(one_hot_encoder_params, newdata = data)
+  }
+  
+  # Remove outliers
+  if (!is.null(outlier_params)) {
+    for (col in names(data)){
+      if(is.numeric(data[[col]])){
+        x <- data[[col]]
+        qnt <- outlier_params[[col]]$quantiles
+        H <- outlier_params[[col]]$H
+        x[x < (qnt[1] - H) | x > (qnt[2] + H)] <- NA
+        data[[col]] <- x
+      }
+    }
+    data <- impute_missing_data(data, method = impute_method) # impute method should be passed or defined
+  }
+  
+  # Interaction terms
+  if (!is.null(interaction_params)) {
+    num_vars <- sapply(data, is.numeric)
+    data[num_vars] <- lapply(data[num_vars], function(x) {
+      if(is.numeric(x)) return(poly(x, degree = interaction_params$degree, interactions = TRUE))
+      return(x)
+    })
+  }
+  
+  # Custom transformations
+  if (!is.null(custom_transform) && is.function(custom_transform)) {
+    data <- custom_transform(data)
+  }
+  
+  return(data)
+}
