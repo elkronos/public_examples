@@ -9,7 +9,9 @@ library(ranger)
 
 #' Preprocess Data for Machine Learning
 #'
-#' This function performs various data preprocessing steps to prepare the data for machine learning tasks.
+#' This function performs various data pre-processing steps to prepare the data for machine learning tasks.
+#' This function is suitable for various machine learning models, including linear regression, logistic regression,
+#' decision trees, random forests, gradient boosting, support vector machines, and neural networks.
 #'
 #' @param data The input data frame.
 #' @param outcome_var The name of the outcome variable.
@@ -20,8 +22,11 @@ library(ranger)
 #' @param custom_transform A custom transformation function to apply to the data (default is NULL).
 #' @param feature_selection Logical indicating whether to perform feature selection (default is TRUE).
 #' @param num_selected_features The number of top features to select (default is 3).
+#' @param ordinal_encoding Logical indicating whether to perform ordinal encoding (default is FALSE).
+#' @param scale_data_flag Logical indicating whether to scale data (default is TRUE).
+#' @param impute_method Method to be used for data imputation (default is 'pmm').
 #'
-#' @return A list containing the preprocessed training and testing datasets.
+#' @return A list containing the preprocessed training dataset, the testing dataset, and a table of feature importances.
 #'
 #' @details This function performs the following preprocessing steps:
 #' \itemize{
@@ -35,9 +40,13 @@ library(ranger)
 #'   \item Apply a custom transformation function, if provided.
 #'   \item Perform feature selection using the Random Forest importance measure.
 #' }
-#' 
-#' This function is suitable for various machine learning models, including linear regression, logistic regression,
-#' decision trees, random forests, gradient boosting, support vector machines, and neural networks.
+#'
+#' @importFrom caret createDataPartition dummyVars
+#' @importFrom dplyr select all_of
+#' @importFrom lubridate as.POSIXct
+#' @importFrom mice mice complete
+#' @importFrom ranger ranger importance
+#' @importFrom stats IQR scale
 #'
 #' @examples
 #' \dontrun{
@@ -76,12 +85,19 @@ library(ranger)
 preprocess_data <- function(data, outcome_var, partition_ratio = 0.7, date_vars = NULL,
                             outlier_multiplier = 1.5, interaction_degree = 2,
                             custom_transform = NULL, feature_selection = TRUE, num_selected_features = 3,
-                            ordinal_encoding = FALSE){
+                            ordinal_encoding = FALSE, scale_data_flag = TRUE, impute_method = 'pmm'){
   
+  # Check if data is a dataframe
+  if (!is.data.frame(data)) {
+    stop("data must be a dataframe")
+  }
+  
+  # Check if outcome_var exists in data
   if (!outcome_var %in% names(data)) {
     stop("outcome_var not found in data")
   }
   
+  # Check if date_vars exist in data
   if (!is.null(date_vars) && !all(date_vars %in% names(data))) {
     stop("Some date_vars not found in data")
   }
@@ -111,7 +127,7 @@ preprocess_data <- function(data, outcome_var, partition_ratio = 0.7, date_vars 
   }
   
   # Partition data
-  trainIndex <- createDataPartition(data[[outcome_var]], p = partition_ratio, list = FALSE, times = 1)
+  trainIndex <- caret::createDataPartition(data[[outcome_var]], p = partition_ratio, list = FALSE, times = 1)
   train <- data[trainIndex, ]
   test <- data[-trainIndex, ]
   
@@ -124,14 +140,13 @@ preprocess_data <- function(data, outcome_var, partition_ratio = 0.7, date_vars 
   }
   
   # Impute missing data
-  impute_missing_data <- function(data){
-    imputed_data <- mice(data, m=5, maxit = 50, method = 'cart', seed = 500)
-    completed_data <- complete(imputed_data,1)
+  impute_missing_data <- function(data, method){
+    imputed_data <- mice::mice(data, m=5, maxit = 50, method = method, seed = 500)
+    completed_data <- mice::complete(imputed_data,1)
     return(completed_data)
   }
   
-  train <- impute_missing_data(train)
-  test <- impute_missing_data(test)
+  train <- impute_missing_data(train, method = impute_method)
   
   # Scale data
   scale_data <- function(data){
@@ -140,17 +155,17 @@ preprocess_data <- function(data, outcome_var, partition_ratio = 0.7, date_vars 
     return(data)
   }
   
-  train <- scale_data(train)
-  test <- scale_data(test)
+  if(scale_data_flag){
+    train <- scale_data(train)
+  }
   
   # One-hot encode
   one_hot_encode <- function(data){
-    data <- dummyVars("~.", data = data, fullRank = TRUE) %>% predict(data)
+    data <- caret::dummyVars("~.", data = data, fullRank = TRUE) %>% predict(data)
     return(data)
   }
   
   train <- one_hot_encode(train)
-  test <- one_hot_encode(test)
   
   # Remove outliers
   remove_outliers <- function(data, multiplier = 1.5){
@@ -163,13 +178,11 @@ preprocess_data <- function(data, outcome_var, partition_ratio = 0.7, date_vars 
         data[[col]] <- x
       }
     }
-    data <- impute_missing_data(data)
+    data <- impute_missing_data(data, method = impute_method)
     return(data)
   }
   
-  
   train <- remove_outliers(train, multiplier = outlier_multiplier)
-  test <- remove_outliers(test, multiplier = outlier_multiplier)
   
   # Interaction terms
   create_interaction_terms <- function(data, degree = 2){
@@ -182,23 +195,28 @@ preprocess_data <- function(data, outcome_var, partition_ratio = 0.7, date_vars 
   }
   
   train <- create_interaction_terms(train, degree = interaction_degree)
-  test <- create_interaction_terms(test, degree = interaction_degree)
-
+  
   # Custom transformations
   if (!is.null(custom_transform) && is.function(custom_transform)) {
     train <- custom_transform(train)
-    test <- custom_transform(test)
   }
   
   importance_table <- NULL
   if (feature_selection) {
     set.seed(123)
-    rf_model <- ranger(outcome_var ~ ., data = train, importance = 'impurity')
-    importance_vector <- importance(rf_model)
+    
+    # Check if outcome_var is numeric or factor
+    if (is.numeric(train[[outcome_var]])) {
+      rf_model <- ranger::ranger(as.formula(paste(outcome_var, "~ .")), data = train, importance = 'impurity')
+    } else {
+      rf_model <- ranger::ranger(as.formula(paste(outcome_var, "~ .")), data = train, importance = 'permutation')
+    }
+    
+    
+    importance_vector <- ranger::importance(rf_model)
     importance_table <- data.frame(Variable = names(importance_vector), Importance = importance_vector)
     top_features <- importance_table$Variable[order(importance_table$Importance, decreasing = TRUE)][1:num_selected_features]
-    train <- train %>% select(all_of(c(outcome_var, top_features)))
-    test <- test %>% select(all_of(c(outcome_var, top_features)))
+    train <- dplyr::select(train, dplyr::all_of(c(outcome_var, top_features)))
   }
   
   return(list(train = train, test = test, importance_table = importance_table))
