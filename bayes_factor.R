@@ -7,29 +7,37 @@ library(ggplot2)
 #'
 #' This function performs a Bayesian t-test to compare the means of two groups using the BayesFactor package. 
 #' The input data, group variable, and response variable should be provided. 
-#' The function checks for errors, performs the Bayesian t-test and prints the Bayes factor value.
+#' The function checks for errors, performs the Bayesian t-test and returns the Bayes factor value.
 #'
 #' @param data A data frame or data table that contains the group_var and response_var.
 #' @param group_var The name of the column in data that contains the group variable. It should be a factor or character variable with at least two levels.
 #' @param response_var The name of the column in data that contains the response variable. It should be a numeric variable.
+#' @param rm_na Logical, if TRUE missing values are removed from the data. Default is FALSE.
+#' @param bf_type A character string specifying the type of Bayes Factor to compute. Default is 'bf'. Options include:
+#' \itemize{
+#'   \item{'bf'}{Standard Bayes factor}
+#'   \item{'logbf'}{Natural logarithm of the Bayes factor}
+#'   \item{'lrt'}{Likelihood ratio test statistic}
+#'   \item{'loglrt'}{Natural logarithm of the likelihood ratio test statistic}
+#' }
 #'
-#' @return This function prints the Bayes factor value for the performed Bayesian t-test.
+#' @return The Bayes factor value for the performed Bayesian t-test.
 #' @references Morey, R. D., & Rouder, J. N. (2018). BayesFactor: Computation of Bayes Factors for Common Designs. R package version 0.9.12-4.2.
 #'
 #' @examples
 #' data(mtcars)
 #' mtcars$group_var <- ifelse(mtcars$mpg > median(mtcars$mpg), 1, 2)
-#' bayes_factor(mtcars, "group_var", "mpg")
+#' bayes_factor(mtcars, "group_var", "mpg", rm_na = TRUE, bf_type = "bf")
 #'
 #' @importFrom data.table data.table
 #' @importFrom BayesFactor ttestBF
 #' @importFrom stats is.numeric
 #' @importFrom utils stop
 #' @export
-bayes_factor <- function(data, group_var, response_var) {
+bayes_factor <- function(data, group_var, response_var, rm_na = FALSE, bf_type = "bf") {
   
   # Error check: validate input parameters
-  if (!inherits(data, "data.frame") && !inherits(data, "data.table")) {
+  if (!inherits(data, c("data.frame", "data.table"))) {
     stop("The 'data' parameter should be a data frame or a data.table.")
   }
   
@@ -37,8 +45,11 @@ bayes_factor <- function(data, group_var, response_var) {
     stop("Please ensure both 'group_var' and 'response_var' are in 'data'.")
   }
   
-  # Check for missing values
-  if (any(is.na(data[[group_var]]) | is.na(data[[response_var]]))) {
+  # Handle missing data
+  if (rm_na) {
+    data <- na.omit(data)
+  }
+  else if (any(is.na(data[[group_var]]) | is.na(data[[response_var]]))) {
     stop("The data contains missing values. Please handle them before proceeding.")
   }
   
@@ -48,7 +59,9 @@ bayes_factor <- function(data, group_var, response_var) {
   }
   
   # Convert the data frame to a data table for efficient processing
-  data <- data.table(data)
+  if (!inherits(data, "data.table")) {
+    data <- data.table(data)
+  }
   
   # Check there are at least two distinct groups
   if (length(unique(data[[group_var]])) < 2) {
@@ -58,8 +71,8 @@ bayes_factor <- function(data, group_var, response_var) {
   # Perform Bayesian t-test
   bf_result <- ttestBF(formula = as.formula(paste(response_var, "~", group_var)), data = data)
   
-  # For large datasets, print just the Bayes factor value, converted from logarithm
-  print(exp(bf_result@bayesFactor$bf))
+  # Return Bayes factor result based on the chosen type
+  return(exp(bf_result@bayesFactor[[bf_type]]))
 }
 
 #' Plot Group Means
@@ -70,20 +83,31 @@ bayes_factor <- function(data, group_var, response_var) {
 #' @param data A data frame or data table that contains the group_var and response_var.
 #' @param group_var The name of the column in data that contains the group variable. It should be a factor or character variable.
 #' @param response_var The name of the column in data that contains the response variable. It should be a numeric variable.
+#' @param title A character string for the plot title. Default is "Group Means".
+#' @param x_label A character string for the x-axis label. Default is "Group".
+#' @param y_label A character string for the y-axis label. Default is "Response".
+#' @param fill_color A character string specifying the fill color for the boxplot. Default is "steelblue".
+#' @param notch Logical, if TRUE makes the box plot a notched box plot. Default is FALSE.
 #'
 #' @return This function returns a ggplot object that displays the boxplot of group means.
 #' 
 #' @examples
 #' data(mtcars)
 #' mtcars$group_var <- ifelse(mtcars$mpg > median(mtcars$mpg), 1, 2)
-#' plot_group_means(mtcars, "group_var", "mpg")
+#' plot_group_means(mtcars, "group_var", "mpg", title = "My Plot", fill_color = "orange", notch = TRUE)
 #'
 #' @importFrom ggplot2 ggplot aes_string geom_boxplot labs theme_minimal
 #' @export
-plot_group_means <- function(data, group_var, response_var) {
-  data[[group_var]] <- as.factor(data[[group_var]])
-  ggplot(data, aes_string(x = group_var, y = response_var)) +
-    geom_boxplot() +
-    labs(title = "Group Means", x = "Group", y = "Response") +
-    theme_minimal()
+plot_group_means <- function(data, group_var, response_var, title = "Group Means", x_label = "Group", y_label = "Response", fill_color = "steelblue", notch = FALSE) {
+  
+  # Convert the group variable to factor if it's not already
+  if(!is.factor(data[[group_var]])) {
+    data[[group_var]] <- as.factor(data[[group_var]])
+  }
+  
+  ggplot(data, aes_string(x = group_var, y = response_var, fill = fill_color)) +
+    geom_boxplot(notch = notch) +
+    labs(title = title, x = x_label, y = y_label) +
+    theme_minimal() +
+    scale_fill_manual(values = fill_color)
 }
