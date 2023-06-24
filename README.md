@@ -1,5 +1,5 @@
 # public_examples
-This repo contains publicly shared code. Please use it as you will. This code is a work in progress, and should be tested before implemented in a production environment.
+This repo contains publicly shared code. Please use it however you like. This code is a work in progress, and should be tested before implemented in a production environment.
 
 ## analysis
 Scripts primarily designed to analyze data. These scripts contain functions which allow for reproduciable analysis in an analytics workflow. Note that the feature selection examples have all been moved over to the `feature_selection` repo (https://github.com/elkronos/feature_selection).
