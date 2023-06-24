@@ -13,6 +13,6 @@ Scripts which allow one to analyze or visualize data. These scripts contain func
 ## visuals
 Scripts designed to visualize data. Although these scripts contain functions which aggregate data, their primary purpose is to visualize data in different ways. Note that all shiny examples have been moved over to the `shiny_examples` repo (https://github.com/elkronos/shiny_examples).
 
-# contact
-email: napoleonic_bores@proton.me
-discord: elkronos
+# Contact
+- email: napoleonic_bores@proton.me
+- discord: elkronos
