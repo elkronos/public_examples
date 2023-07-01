@@ -10,6 +10,8 @@ library(pracma)
 #' identifies and handles outliers, and tests for seasonality. If seasonality is detected, it decomposes the 
 #' time series into its seasonal, trend, and irregular components, and plots the seasonal component for visualization.
 #' 
+#' See a shiny application version of this function here: https://github.com/elkronos/shiny_examples/blob/main/analysis/seasonality_detection.R
+#' 
 #' @param time_series A numeric vector or an object of class 'ts'. The time series to be analyzed for seasonality. 
 #' Missing values in the time series are automatically omitted.
 #' @param transformation A string. The method for transforming the time series to handle non-stationarity. 
@@ -19,8 +21,8 @@ library(pracma)
 #' @param outlier_method A string. The method for identifying and handling outliers. Defaults to "hampel".
 #' @param k A numeric value. The number of iterations in the Hampel identifier for outlier detection. 
 #' Defaults to 3.
-#' @param test_type A string. The test to be used for testing seasonality. Defaults to "auto". Other options 
-#' are "ch" and "ocsb".
+#' @param test_type A string. The test to be used for testing seasonality. Defaults to "auto". This uses the nsdiffs() 
+#' function from the 'forecast' package to determine the number of differences required to make the time series stationary.
 #' @param window A string. The window type to be used for decomposing the time series. Defaults to "periodic".
 #' @param detect_freq A logical value. Whether to automatically detect the frequency of the time series. 
 #' Defaults to TRUE.
@@ -56,7 +58,7 @@ library(pracma)
 #'   print(interactive_plot)
 #' }
 #' 
-#' @importFrom forecast BoxCox BoxCox.lambda
+#' @importFrom forecast BoxCox BoxCox.lambda nsdiffs
 #' @importFrom ggplot2 aes geom_line labs theme_minimal ggplot
 #' @importFrom pracma hampel
 #' 
@@ -95,10 +97,6 @@ detect_seasonality <- function(time_series, transformation = "boxcox", lambda = 
   # Test for seasonality
   if(test_type == "auto"){
     ndiffs <- nsdiffs(time_series_transformed)
-  } else if(test_type == "ch"){
-    ndiffs <- ifelse(chTest(time_series_transformed)$p.value < 0.05, 1, 0)
-  } else if(test_type == "ocsb"){
-    ndiffs <- ifelse(OCSBtest(time_series_transformed)$p.value < 0.05, 1, 0)
   }
   
   # If ndiffs > 0, there is seasonality
