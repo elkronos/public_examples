@@ -2,6 +2,7 @@
 library(BayesFactor)
 library(data.table)
 library(ggplot2)
+library(rlang)
 
 #' Perform Bayes Factor Analysis
 #'
@@ -34,22 +35,25 @@ library(ggplot2)
 #' @importFrom stats is.numeric
 #' @importFrom utils stop
 #' @export
+library(data.table)
+
 bayes_factor <- function(data, group_var, response_var, rm_na = FALSE, bf_type = "bf") {
   
-  # Error check: validate input parameters
-  if (!inherits(data, c("data.frame", "data.table"))) {
-    stop("The 'data' parameter should be a data frame or a data.table.")
+  # Convert the data frame to a data table for efficient processing
+  if (!inherits(data, "data.table")) {
+    data <- data.table(data)
   }
   
+  # Error check: validate input parameters
   if (!all(c(group_var, response_var) %in% names(data))) {
     stop("Please ensure both 'group_var' and 'response_var' are in 'data'.")
   }
   
   # Handle missing data
   if (rm_na) {
-    data <- na.omit(data)
+    data[, (c(group_var, response_var)) := lapply(.SD, na.omit), .SDcols = c(group_var, response_var)]
   }
-  else if (any(is.na(data[[group_var]]) | is.na(data[[response_var]]))) {
+  else if (any(data[, sum(is.na(.SD)), .SDcols = c(group_var, response_var)] > 0)) {
     stop("The data contains missing values. Please handle them before proceeding.")
   }
   
@@ -58,22 +62,18 @@ bayes_factor <- function(data, group_var, response_var, rm_na = FALSE, bf_type =
     stop("The 'response_var' should be numeric.")
   }
   
-  # Convert the data frame to a data table for efficient processing
-  if (!inherits(data, "data.table")) {
-    data <- data.table(data)
-  }
-  
   # Check there are at least two distinct groups
-  if (length(unique(data[[group_var]])) < 2) {
+  if (uniqueN(data[[group_var]]) < 2) {
     stop("There must be at least two distinct groups in 'group_var'.")
   }
   
   # Perform Bayesian t-test
-  bf_result <- ttestBF(formula = as.formula(paste(response_var, "~", group_var)), data = data)
+  bf_result <- BayesFactor::ttestBF(formula = as.formula(paste(response_var, "~", group_var)), data = data)
   
   # Return Bayes factor result based on the chosen type
   return(exp(bf_result@bayesFactor[[bf_type]]))
 }
+
 
 #' Plot Group Means
 #'
@@ -98,16 +98,30 @@ bayes_factor <- function(data, group_var, response_var, rm_na = FALSE, bf_type =
 #'
 #' @importFrom ggplot2 ggplot aes_string geom_boxplot labs theme_minimal
 #' @export
-plot_group_means <- function(data, group_var, response_var, title = "Group Means", x_label = "Group", y_label = "Response", fill_color = "steelblue", notch = FALSE) {
+plot_group_means <- function(data, group_var, response_var, title = "Group Means", 
+                             x_label = "Group", y_label = "Response", fill_color = "steelblue", 
+                             notch = FALSE, rm_na = FALSE, bf_type = "bf", show_bf = TRUE) {
   
   # Convert the group variable to factor if it's not already
   if(!is.factor(data[[group_var]])) {
     data[[group_var]] <- as.factor(data[[group_var]])
   }
   
-  ggplot(data, aes_string(x = group_var, y = response_var, fill = fill_color)) +
+  # Create the boxplot
+  p <- ggplot(data, aes(x = .data[[sym(group_var)]], y = .data[[sym(response_var)]], fill = .data[[sym(group_var)]])) +
     geom_boxplot(notch = notch) +
     labs(title = title, x = x_label, y = y_label) +
     theme_minimal() +
     scale_fill_manual(values = fill_color)
+  
+  # Calculate Bayes Factor for each group comparison
+  if(show_bf) {
+    bf <- bayes_factor(data, group_var, response_var, rm_na, bf_type)
+    
+    # Add Bayes Factor as annotation to the plot
+    p <- p + geom_text(x = 1.5, y = max(data[[response_var]]), 
+                       label = paste("Bayes Factor =", round(bf, 2)), hjust = 0)
+  }
+  
+  return(p)
 }
