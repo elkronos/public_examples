@@ -81,15 +81,14 @@ query_qwi <- function(start_year, end_year, states = NULL, endpoints = c("sa", "
   return(qwi_data_list)
 }
 
-# Save flattened file
-# Load the necessary package
-library(dplyr)
-
-## Add an identifier column
-# qwi_save$sa$identifier <- 'sa'
-# qwi_save$se$identifier <- 'se'
-# qwi_save$rh$identifier <- 'rh'
-# 
-## Bind the rows
-# flattened_df <- bind_rows(qwi_save$sa, qwi_save$se, qwi_save$rh)
-# 
+#' # Save flattened file
+#' # Load the necessary package
+#'  library(dplyr)
+#' # Add an identifier column
+#'  qwi_save$sa$identifier <- 'sa'
+#'  qwi_save$se$identifier <- 'se'
+#'  qwi_save$rh$identifier <- 'rh'
+#'  
+#' # Bind the rows
+#'  flattened_df <- bind_rows(qwi_save$sa, qwi_save$se, qwi_save$rh)
+#'  
