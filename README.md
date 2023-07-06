@@ -10,6 +10,9 @@ Scripts which serve as examples of how to carry out specific actions (item analy
 ## helpers
 Scripts which allow one to analyze or visualize data. These scripts contain functions which are designed to support a wider purpose (data integration via fuzzy matching, or outlier detection). Note that all of the OpenAI API scripts (GPT) have been moved over to the `openai_api` repo (https://github.com/elkronos/openai_api). 
 
+## queries
+Scripts designed to query data from APIs or other systems.
+
 ## visuals
 Scripts designed to visualize data. Although these scripts contain functions which aggregate data, their primary purpose is to visualize data in different ways. Note that all shiny examples have been moved over to the `shiny_examples` repo (https://github.com/elkronos/shiny_examples).
 
