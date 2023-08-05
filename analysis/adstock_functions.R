@@ -101,6 +101,14 @@ train_and_predict <- function(x_train, x_test, adstocked_train) {
   predictions <- predict(model, newdata = data.frame(time_train = time_test))
   return(predictions)
 }
+train_and_predict <- function(x_train, x_test, adstocked_train) {
+  time_train <- seq_along(x_train)
+  model <- lm(adstocked_train ~ time_train)
+  
+  time_test <- seq_along(x_test) + length(x_train)
+  predictions <- predict(model, newdata = data.frame(time_train = time_test))
+  return(predictions)
+}
 
 #' K-fold Cross-Validation for Adstock Transformation
 #'
@@ -135,12 +143,10 @@ k_fold_cv <- function(x, lag, decay, k = 10) {
     test_indices <- ((i - 1) * fold_size + 1):min(i * fold_size, length(x))
     train_indices <- setdiff(seq_len(length(x)), test_indices)
     
+    x_train <- x[train_indices]
     x_test <- x[test_indices]
     
-    # Calculate adstock transformation using base R functions
-    adstocked_full <- colSums(embed(c(rep(0, lag - 1), x), lag) * weights)
-    adstocked_test <- adstocked_full[test_indices]
-    
+    adstocked_train <- colSums(embed(c(rep(0, lag - 1), x_train), lag) * weights)
     predictions <- train_and_predict(x_train, x_test, adstocked_train)
     errors[i] <- sse(x_test, predictions)
     
