@@ -101,14 +101,6 @@ train_and_predict <- function(x_train, x_test, adstocked_train) {
   predictions <- predict(model, newdata = data.frame(time_train = time_test))
   return(predictions)
 }
-train_and_predict <- function(x_train, x_test, adstocked_train) {
-  time_train <- seq_along(x_train)
-  model <- lm(adstocked_train ~ time_train)
-  
-  time_test <- seq_along(x_test) + length(x_train)
-  predictions <- predict(model, newdata = data.frame(time_train = time_test))
-  return(predictions)
-}
 
 #' K-fold Cross-Validation for Adstock Transformation
 #'
