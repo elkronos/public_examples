@@ -1,3 +1,6 @@
+# Load library
+library(ggplot2)
+
 #' Plot Time Series with Optional Filled Area Between Two Series
 #'
 #' This function creates a line plot for time series data. If two series are provided and `fill_between` is TRUE,
