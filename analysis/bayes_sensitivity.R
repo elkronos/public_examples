@@ -1,3 +1,5 @@
+# Moving forward please see the bmbeR repo: https://github.com/elkronos/bmbeR
+
 # Load necessary packages
 library(rstanarm)
 library(bayesplot)
