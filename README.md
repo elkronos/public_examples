@@ -15,7 +15,3 @@ Scripts designed to query data from APIs or other systems.
 
 ## visuals
 Scripts designed to visualize data. Although these scripts contain functions which aggregate data, their primary purpose is to visualize data in different ways. Note that all shiny examples have been moved over to the `shiny_examples` repo (https://github.com/elkronos/shiny_examples).
-
-# Contact
-- email: napoleonic_bores@proton.me
-- discord: elkronos
