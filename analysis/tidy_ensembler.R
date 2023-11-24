@@ -286,42 +286,59 @@ bagging_ensemble <- function(models, test_data) {
 
 #' Voting Ensemble
 #'
-#' This function performs an ensemble by taking a weighted or unweighted average of predictions from a list of models on the provided test data.
+#' Performs a voting ensemble by taking a weighted or equal-weighted average of predictions 
+#' from a list of models on the provided test data. If weights are not specified, each model 
+#' is assigned equal weight. If weights are provided, they are used to compute a weighted 
+#' average of the model predictions.
 #'
-#' @param models A list of trained models for which predictions will be used in the voting ensemble.
-#' @param test_data The data on which to make predictions.
-#' @param weights Optional. Weights for models when computing the weighted average. If not provided, equal weights are assigned to all models.
+#' @param models A list of trained models for which predictions will be combined in the voting ensemble.
+#' @param test_data The dataset on which predictions will be made.
+#' @param weights An optional numeric vector of weights for each model in the ensemble.
+#'               The length of this vector must match the number of models. If not provided,
+#'               equal weights are assigned to all models. Weights should be non-negative and
+#'               need not sum to one; they will be normalized internally.
 #'
-#' @return A vector of predictions obtained by taking a weighted or unweighted average of predictions from the input models.
+#' @return A numeric vector of predictions obtained by averaging the predictions from the input models.
+#'         The averaging is weighted if weights are provided; otherwise, it is an unweighted (equal-weighted) average.
 #'
 #' @seealso \code{\link{ensemble_models}}, \code{\link{average_ensemble}}, \code{\link{weighted_average_ensemble}}, \code{\link{bagging_ensemble}}
 #'
 #' @examples
-#' # Create example data
-#' set.seed(123)
-#' test_data <- data.frame(x = rnorm(50))
-#' models <- list(model1 = lm(y ~ x, data = train_data), model2 = glm(y ~ x, data = train_data))
-#' 
-#' # Ensemble using unweighted voting method
-#' voting_ensemble(models, test_data)
+#' \dontrun{
+#'   # Create example data
+#'   set.seed(123)
+#'   test_data <- data.frame(x = rnorm(50))
+#'   train_data <- data.frame(x = rnorm(100), y = rnorm(100))
+#'   models <- list(model1 = lm(y ~ x, data = train_data), model2 = glm(y ~ x, data = train_data))
+#'   
+#'   # Ensemble using unweighted voting method
+#'   voting_predictions_unweighted <- voting_ensemble(models, test_data)
 #'
-#' # Ensemble using weighted voting method
-#' voting_ensemble(models, test_data, weights = c(0.6, 0.4))
+#'   # Ensemble using weighted voting method
+#'   voting_predictions_weighted <- voting_ensemble(models, test_data, weights = c(0.6, 0.4))
+#' }
 #'
 #' @export
 voting_ensemble <- function(models, test_data, weights = NULL) {
+  num_models <- length(models)
+  
+  # Default weights if not provided
   if (is.null(weights)) {
-    weights <- rep(1 / length(models), length(models))
+    weights <- rep(1 / num_models, num_models)
   }
+  
+  # Check if weights length matches the number of models
+  if (length(weights) != num_models) {
+    stop("Invalid weights: length of weights does not match number of models")
+  }
+  
   predictions <- lapply(models, predict, new_data = test_data)
   pred_matrix <- do.call(cbind, predictions)
   
-  if (is.null(weights)) {
-    return(apply(pred_matrix, 1, function(x) mean(x)))
-  } else {
-    weighted_votes <- pred_matrix * weights
-    return(apply(weighted_votes, 1, function(x) sum(x) / sum(weights)))
-  }
+  # Apply weights to predictions
+  weighted_predictions <- pred_matrix * weights
+  final_predictions <- rowSums(weighted_predictions) / sum(weights)
+  return(final_predictions)
 }
 
 
