@@ -73,13 +73,23 @@ stack <- stacks() %>%
   blend_predictions() %>%
   fit_members()
 
-# 7. Evaluate the model on test data - Get Predicted Probabilities
-stack_prob_predictions <- predict(stack, new_data = test_data, type = "prob")
-test_data_prob_results <- bind_cols(test_data, stack_prob_predictions)
+# 7. Evaluate the model on test data
+predictions <- predict(stack, new_data = test_data)
+combined_data <- bind_cols(test_data, predictions)
+metrics <- yardstick::metrics(combined_data, truth = classes, estimate = .pred_class)
 
 # 8. Visualization - ROC Curve
-stack_plot <- test_data_prob_results %>%
-  roc_curve(truth = classes, .pred_1) %>%
+# Generate predictions with probabilities
+predictions <- predict(stack, new_data = test_data, type = "prob")
+
+# Combine the test data with the predictions
+combined_data <- bind_cols(test_data, predictions)
+
+# Check the structure of the new predictions to find the correct column names
+str(predictions)
+
+# Assuming the column name for the predicted probability of class 1 is '.pred_1' (replace with the actual column name)
+stack_plot <- roc_curve(combined_data, truth = classes, .pred_1) %>%
   ggplot(aes(x = 1 - specificity, y = sensitivity)) +
   geom_line() +
   coord_equal() +
