@@ -197,65 +197,149 @@ tune_model <- function(model, train_data, response, predictors, resamples, metri
 
 #' Average Ensemble
 #'
-#' This function performs an ensemble by averaging predictions from a list of models on the provided test data.
+#' Performs an ensemble by averaging predictions from a list of models on the provided test data.
+#' Supports mean, median, and weighted average methods.
 #'
 #' @param models A list of trained models for which predictions will be averaged.
 #' @param test_data The data on which to make predictions.
+#' @param method The method of averaging to use: "mean" or "median". 
+#'               Defaults to "mean". If "mean" is selected and weights are provided,
+#'               a weighted average is computed.
+#' @param weights Optional vector of weights for a weighted average. 
+#'               If provided, the length must match the number of models.
+#'               Weights are normalized to sum to 1.
 #'
-#' @return A vector of predictions obtained by averaging predictions from the input models.
+#' @return A vector of predictions obtained by the specified method of averaging predictions 
+#'         from the input models. If "mean" is selected, returns the (weighted) mean of predictions.
+#'         If "median" is selected, returns the median of predictions.
 #'
-#' @seealso \code{\link{ensemble_models}}, \code{\link{weighted_average_ensemble}}, \code{\link{bagging_ensemble}}, \code{\link{voting_ensemble}}
+#' @seealso \code{\link{ensemble_models}}, \code{\link{weighted_average_ensemble}}, 
+#'         \code{\link{bagging_ensemble}}}
 #'
 #' @examples
-#' # Create example data
-#' set.seed(123)
-#' test_data <- data.frame(x = rnorm(50))
-#' models <- list(model1 = lm(y ~ x, data = train_data), model2 = glm(y ~ x, data = train_data))
-#' 
-#' # Ensemble using average method
-#' average_ensemble(models, test_data)
+#' \dontrun{
+#'   # Create example data
+#'   set.seed(123)
+#'   test_data <- data.frame(x = rnorm(50))
+#'   models <- list(model1 = lm(y ~ x, data = train_data), model2 = glm(y ~ x, data = train_data))
+#'   
+#'   # Ensemble using mean method
+#'   average_ensemble(models, test_data)
+#'
+#'   # Ensemble using median method
+#'   average_ensemble(models, test_data, method = "median")
+#'
+#'   # Ensemble using weighted mean method
+#'   weights <- c(0.5, 0.5)  # Example weights
+#'   average_ensemble(models, test_data, method = "mean", weights = weights)
+#' }
 #'
 #' @export
-average_ensemble <- function(models, test_data) {
+average_ensemble <- function(models, test_data, method = "mean", weights = NULL) {
   predictions <- lapply(models, predict, new_data = test_data)
-  return(rowMeans(do.call(cbind, predictions)))
+  pred_matrix <- do.call(cbind, predictions)
+  
+  # Check for custom weights
+  if (!is.null(weights)) {
+    if (length(weights) != length(models)) {
+      stop("The length of weights must match the number of models.")
+    }
+    # Normalizing weights
+    normalized_weights <- weights / sum(weights)
+  } else {
+    normalized_weights <- rep(1 / length(models), length(models))
+  }
+  
+  # Apply specified method
+  if (method == "mean") {
+    return(rowSums(pred_matrix * normalized_weights) / sum(normalized_weights))
+  } else if (method == "median") {
+    return(apply(pred_matrix, 1, median))
+  } else {
+    stop("Invalid method specified. Choose 'mean' or 'median'.")
+  }
+}
+
+
+#' Calculate Model Weights Based on Performance
+#'
+#' Computes weights for a set of models based on their performance. The function calculates 
+#' the Root Mean Squared Error (RMSE) for each model on the test data, then uses the inverse 
+#' of these RMSE values as weights. Weights are normalized so that they sum to 1. Models with 
+#' lower RMSE will have higher weights.
+#'
+#' @param model_results A list of trained models.
+#' @param test_data The test data used for making predictions and calculating RMSE.
+#' @param response The name of the response variable in the test data.
+#'
+#' @return A numeric vector of normalized weights for the models.
+#'
+#' @examples
+#' \dontrun{
+#'   # Assume model_results is a list of trained models
+#'   # and test_data is the dataset for testing
+#'   # response is the name of the response variable in test_data
+#'   weights <- calculate_weights(model_results, test_data, "response")
+#' }
+#'
+#' @export
+calculate_weights <- function(model_results, test_data, response) {
+  # Calculate RMSE for each model
+  model_rmse <- sapply(model_results, function(model) {
+    if (!is.null(model)) {
+      predictions <- predict(model, new_data = test_data)$.pred
+      sqrt(mean((predictions - test_data[[response]])^2))
+    } else {
+      NA_real_
+    }
+  })
+  
+  # Inverse RMSE for weights (handling NA values)
+  inverse_rmse <- ifelse(is.na(model_rmse), 0, 1 / model_rmse)
+  
+  # Normalize weights
+  normalized_weights <- inverse_rmse / sum(inverse_rmse)
+  return(normalized_weights)
 }
 
 
 #' Weighted Average Ensemble
 #'
-#' This function performs an ensemble by taking a weighted average of predictions from a list of models on the provided test data.
+#' Computes a weighted average of predictions from a list of models on the provided test data.
+#' If weights are not specified, equal weights are assigned to all models. The function 
+#' normalizes the weights so that they sum to 1, ensuring a proper weighted average calculation.
 #'
 #' @param models A list of trained models for which predictions will be weighted and averaged.
 #' @param test_data The data on which to make predictions.
-#' @param weights Optional. Weights for models when computing the weighted average. If not provided, equal weights are assigned to all models.
+#' @param weights An optional numeric vector of weights for the models when computing 
+#'        the weighted average. If not provided, equal weights are used. The length 
+#'        of the weights vector should match the number of models.
 #'
-#' @return A vector of predictions obtained by taking a weighted average of predictions from the input models.
+#' @return A vector of predictions obtained by taking a weighted average of predictions 
+#'         from the input models. If weights are not provided, it defaults to an 
+#'         equal-weighted average.
 #'
-#' @seealso \code{\link{ensemble_models}}, \code{\link{average_ensemble}}, \code{\link{bagging_ensemble}}, \code{\link{voting_ensemble}}
+#' @seealso \code{\link{ensemble_models}}, \code{\link{average_ensemble}}, 
+#'         \code{\link{bagging_ensemble}}}
 #'
 #' @examples
-#' # Create example data
-#' set.seed(123)
-#' test_data <- data.frame(x = rnorm(50))
-#' models <- list(model1 = lm(y ~ x, data = train_data), model2 = glm(y ~ x, data = train_data))
-#' 
-#' # Ensemble using weighted_average method
-#' weighted_average_ensemble(models, test_data, weights = c(0.6, 0.4))
+#' \dontrun{
+#'   # Create example data
+#'   set.seed(123)
+#'   test_data <- data.frame(x = rnorm(50))
+#'   models <- list(model1 = lm(y ~ x, data = train_data), model2 = glm(y ~ x, data = train_data))
+#'   
+#'   # Ensemble using weighted average method with custom weights
+#'   weights <- c(0.6, 0.4)  # Example weights
+#'   weighted_average_ensemble(models, test_data, weights)
+#' }
 #'
 #' @export
 weighted_average_ensemble <- function(models, test_data, weights) {
-  if (is.null(weights)) {
-    weights <- rep(1 / length(models), length(models))
-  }
-  if (length(weights) != length(models)) {
-    stop("Invalid weights for weighted average")
-  }
   predictions <- lapply(models, predict, new_data = test_data)
   pred_matrix <- do.call(cbind, predictions)
   return(rowSums(pred_matrix * weights) / sum(weights))
 }
-
 
 #' Bagging Ensemble
 #'
@@ -266,7 +350,7 @@ weighted_average_ensemble <- function(models, test_data, weights) {
 #'
 #' @return A vector of predictions obtained by taking the average of predictions from the input models.
 #'
-#' @seealso \code{\link{ensemble_models}}, \code{\link{average_ensemble}}, \code{\link{weighted_average_ensemble}}, \code{\link{voting_ensemble}}
+#' @seealso \code{\link{ensemble_models}}, \code{\link{average_ensemble}}, \code{\link{weighted_average_ensemble}}
 #'
 #' @examples
 #' # Create example data
@@ -284,74 +368,16 @@ bagging_ensemble <- function(models, test_data) {
 }
 
 
-#' Voting Ensemble
-#'
-#' Performs a voting ensemble by taking a weighted or equal-weighted average of predictions 
-#' from a list of models on the provided test data. If weights are not specified, each model 
-#' is assigned equal weight. If weights are provided, they are used to compute a weighted 
-#' average of the model predictions.
-#'
-#' @param models A list of trained models for which predictions will be combined in the voting ensemble.
-#' @param test_data The dataset on which predictions will be made.
-#' @param weights An optional numeric vector of weights for each model in the ensemble.
-#'               The length of this vector must match the number of models. If not provided,
-#'               equal weights are assigned to all models. Weights should be non-negative and
-#'               need not sum to one; they will be normalized internally.
-#'
-#' @return A numeric vector of predictions obtained by averaging the predictions from the input models.
-#'         The averaging is weighted if weights are provided; otherwise, it is an unweighted (equal-weighted) average.
-#'
-#' @seealso \code{\link{ensemble_models}}, \code{\link{average_ensemble}}, \code{\link{weighted_average_ensemble}}, \code{\link{bagging_ensemble}}
-#'
-#' @examples
-#' \dontrun{
-#'   # Create example data
-#'   set.seed(123)
-#'   test_data <- data.frame(x = rnorm(50))
-#'   train_data <- data.frame(x = rnorm(100), y = rnorm(100))
-#'   models <- list(model1 = lm(y ~ x, data = train_data), model2 = glm(y ~ x, data = train_data))
-#'   
-#'   # Ensemble using unweighted voting method
-#'   voting_predictions_unweighted <- voting_ensemble(models, test_data)
-#'
-#'   # Ensemble using weighted voting method
-#'   voting_predictions_weighted <- voting_ensemble(models, test_data, weights = c(0.6, 0.4))
-#' }
-#'
-#' @export
-voting_ensemble <- function(models, test_data, weights = NULL) {
-  num_models <- length(models)
-  
-  # Default weights if not provided
-  if (is.null(weights)) {
-    weights <- rep(1 / num_models, num_models)
-  }
-  
-  # Check if weights length matches the number of models
-  if (length(weights) != num_models) {
-    stop("Invalid weights: length of weights does not match number of models")
-  }
-  
-  predictions <- lapply(models, predict, new_data = test_data)
-  pred_matrix <- do.call(cbind, predictions)
-  
-  # Apply weights to predictions
-  weighted_predictions <- pred_matrix * weights
-  final_predictions <- rowSums(weighted_predictions) / sum(weights)
-  return(final_predictions)
-}
-
-
 #' Ensemble Models
 #'
 #' This function ensembles multiple models using the specified method and returns predictions on test data.
 #'
 #' @param models A list of trained models to be ensembled.
-#' @param method The ensemble method to use. Options include "average", "weighted_average", "bagging", and "voting".
+#' @param method The ensemble method to use. Options include "average", "weighted_average", and "bagging".
 #' @param test_data The data on which to make predictions.
 #' @param train_data Optional. The training data used for some ensemble methods.
 #' @param response Optional. The response variable used for some ensemble methods.
-#' @param weights Optional. Weights for models when using "weighted_average" or "voting" methods.
+#' @param weights Optional. Weights for models when using "weighted_average".
 #'
 #' @return A vector of predictions based on the specified ensemble method.
 #'
@@ -371,7 +397,7 @@ voting_ensemble <- function(models, test_data, weights = NULL) {
 #' # Ensemble using bagging method
 #' ensemble_models(models, method = "bagging", test_data)
 #'
-#' @seealso \code{\link{average_ensemble}}, \code{\link{weighted_average_ensemble}}, \code{\link{bagging_ensemble}}, \code{\link{voting_ensemble}}
+#' @seealso \code{\link{average_ensemble}}, \code{\link{weighted_average_ensemble}}, \code{\link{bagging_ensemble}}
 #'
 #' @export
 ensemble_models <- function(models, method, test_data, train_data = NULL, response = NULL, weights = NULL) {
@@ -379,7 +405,6 @@ ensemble_models <- function(models, method, test_data, train_data = NULL, respon
          "average" = average_ensemble(models, test_data),
          "weighted_average" = weighted_average_ensemble(models, test_data, weights),
          "bagging" = bagging_ensemble(models, test_data),
-         "voting" = voting_ensemble(models, test_data, weights),
          stop("Invalid method specified"))
 }
 
@@ -412,7 +437,7 @@ ensemble_models <- function(models, method, test_data, train_data = NULL, respon
 #' run_models(data, response = "response", predictors, models)
 #'
 #' # Train models with ensembling
-#' run_models(data, response = "response", predictors, models, method = "voting")
+#' run_models(data, response = "response", predictors, models, method = "bagging")
 #'
 #' @seealso \code{\link{ensemble_models}}, \code{\link{define_model}}, \code{\link{tune_model}}, \code{\link{fit_model}}
 #'
@@ -475,7 +500,7 @@ run_models <- function(data, response, predictors, models, v_fold = 5, grid_size
 #'
 #' # Define models and ensembling methods to test
 #' models_to_test <- c("OLS", "Ridge", "Lasso", "Elastic Net")
-#' ensembling_methods <- c("average", "weighted_average", "bagging", "voting")
+#' ensembling_methods <- c("average", "weighted_average", "bagging")
 #'
 #' # Function to test error handling
 #' test_error_handling <- function() {
