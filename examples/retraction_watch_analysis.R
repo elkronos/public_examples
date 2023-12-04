@@ -1,4 +1,5 @@
 # Get data here: https://www.crossref.org/blog/news-crossref-and-retraction-watch/
+# Shiny applicaiton here: https://github.com/elkronos/shiny_examples/blob/main/analysis/retraction_watch_by_country.R
 
 library(readr)
 library(dplyr)
@@ -10,7 +11,7 @@ library(stringr)
 library(forcats)
 
 # Load your data
-data <- read_csv("C:/Users/JChas/OneDrive/Desktop/exampleshiny/data.csv")
+data <- read_csv("data.csv")
 
 # Check if 'RetractionDate', 'Country', and 'Reason' columns exist
 required_columns <- c('RetractionDate', 'Country', 'Reason')
