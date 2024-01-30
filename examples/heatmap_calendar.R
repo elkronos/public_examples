@@ -1,11 +1,12 @@
-# Load the required library
+# Load the required libraries
 library(lubridate)
 library(ggplot2)
 library(reshape2)
+library(RColorBrewer)
 
 set.seed(123)
 
-# Generate sequence of dates for 2022
+# Generate sequence of dates for 2023
 dates <- seq(ymd("2023-01-01"), ymd("2023-12-31"), by = "day")
 
 # Generate a random number between 1 and 5 for each date
@@ -23,7 +24,7 @@ result$Month <- month(result$Date)
 
 # Create a complete grid of days and months
 grid <- expand.grid(Day = 1:31, Month = 1:12)
-grid$MonthName <- month.abb[grid$Month]
+grid$MonthName <- factor(month.abb[grid$Month], levels = month.abb)
 
 # Merge the grid with the result data
 merged_result <- merge(grid, result, by = c("Day", "Month"), all.x = TRUE)
@@ -32,12 +33,15 @@ merged_result <- merge(grid, result, by = c("Day", "Month"), all.x = TRUE)
 merged_result$ValidDay <- !is.na(merged_result$RandomNumber)
 merged_result$RandomNumber[!merged_result$ValidDay] <- NA
 
-# Create the heatmap with labels and gray out the invalid days
+# Define a nicer color palette
+color_palette <- brewer.pal(9, "Blues")
+
+# Create the heatmap with labels and improved color scheme
 ggplot(merged_result, aes(x = MonthName, y = Day, fill = RandomNumber)) +
   geom_tile(color = "white", aes(fill = ifelse(ValidDay, RandomNumber, NA))) +
   geom_text(aes(label = ifelse(ValidDay, RandomNumber, "")), color = "black", size = 3) +
-  scale_fill_gradient(low = "lightblue", high = "darkred", na.value = "darkgray") +
-  scale_y_continuous(breaks = 1:31) + # Add each day to the y-axis
+  scale_fill_gradientn(colors = color_palette, na.value = "darkgray") +
+  scale_y_continuous(breaks = 1:31) +
   theme_minimal() +
   labs(x = "Month", y = "Day", fill = "Random Number", 
        title = "Calendar Heatmap of 1 Random Number for Each Day in 2023") +
