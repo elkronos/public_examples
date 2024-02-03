@@ -222,45 +222,28 @@ coefplot(model_age_sex_moves_slope, sort = "magnitude", intercept = TRUE)
 
 ################################################################## Adding reasons
 
-vif_model <- lm(mental_health ~ number_of_moves + age + sex + reason_1 + reason_2 + reason_3 + reason_4 + reason_5 + reason_6 + reason_7, data = sample_data)
-vif(vif_model)
+# Modify the existing sample_data creation code
+sample_data$move_reason1 = ifelse(sample_data$move_reason == 1, 1, -1)
+sample_data$move_reason2 = ifelse(sample_data$move_reason == 2, 1, -1)
+sample_data$move_reason3 = ifelse(sample_data$move_reason == 3, 1, -1)
+sample_data$move_reason4 = ifelse(sample_data$move_reason == 4, 1, -1)
+sample_data$move_reason5 = ifelse(sample_data$move_reason == 5, 1, -1)
+sample_data$move_reason6 = ifelse(sample_data$move_reason == 6, 1, -1)
+sample_data$move_reason7 = ifelse(sample_data$move_reason == 7, 1, -1)
 
-# Update the model to include reason variables
-model_age_sex_moves_reasons_slope <- lmer(mental_health ~ number_of_moves + age + sex + reason_1 + reason_2 + reason_3 + reason_4 + reason_5 + reason_6 + reason_7 + (number_of_moves|individual_identifier), data = sample_data, REML = FALSE)
+# Model with interactions for each move reason
+model_move_reasons_interactions <- lmer(mental_health ~ number_of_moves * move_reason1 + 
+                                          number_of_moves * move_reason2 + 
+                                          number_of_moves * move_reason3 + 
+                                          number_of_moves * move_reason4 + 
+                                          number_of_moves * move_reason5 + 
+                                          number_of_moves * move_reason6 + 
+                                          number_of_moves * move_reason7 + 
+                                          age + sex + (1|individual_identifier), 
+                                        data = sample_data, REML = FALSE)
 
-# Descriptively review reaons (assuming each is named 'reason_1', 'reason_2', etc)
 
-# Frequency Distribution of each reason
-for(i in 1:7) {
-  cat("Frequency Distribution for Reason", i, ":\n")
-  print(table(sample_data[[paste0("reason_", i)]]))
-  cat("\n")
-}
-
-# Cross-tabulations with a categorical variable (e.g., sex)
-for(i in 1:7) {
-  cat("Cross-tabulation with Sex for Reason", i, ":\n")
-  print(table(sample_data$sex, sample_data[[paste0("reason_", i)]]))
-  cat("\n")
-}
-
-# Summary statistics for mental health scores for each reason
-for(i in 1:7) {
-  cat("Summary Statistics for Mental Health for Reason", i, ":\n")
-  summary_stats <- sample_data %>%
-    group_by(sample_data[[paste0("reason_", i)]]) %>%
-    summarise(Mean = mean(mental_health, na.rm = TRUE), 
-              SD = sd(mental_health, na.rm = TRUE),
-              Count = n())
-  print(summary_stats)
-  cat("\n")
-}
-
-# Optionally, visualize the distribution
-for(i in 1:7) {
-  ggplot(sample_data, aes_string(x = paste0("reason_", i), y = "mental_health")) +
-    geom_boxplot() +
-    labs(title = paste("Mental Health Distribution for Reason", i))
-}
+# Call summary
+summary(model_move_reasons_interactions)
 
 
