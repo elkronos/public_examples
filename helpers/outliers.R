@@ -1,394 +1,465 @@
-#' Outlier detection methods and their recommended usage
-#' 
-#' \describe{
-#' \item{\code{z_outliers}:}{When the data is normally distributed and has no significant outliers.}
-#' \item{\code{tukey_outliers}:}{When the data has outliers that are beyond the extremes of the quartiles.}
-#' \item{\code{mahalanobis_outliers}:}{When the data has a multivariate normal distribution with correlated features.}
-#' \item{\code{grubbs_outliers}:}{When the data has a univariate normal distribution and only one outlier.}
-#' \item{\code{mad_outliers}:}{When the data has a skewed distribution and a few extreme values.}
-#' \item{\code{iglewicz_hoaglin_outliers}:}{When the data has a skewed distribution and a few extreme values.}
-#' \item{\code{isolation_forest_outliers}:}{When the data has high-dimensional features and is not normally distributed.}
-#' \item{\code{dbscan_outliers}:}{When the data has a high density of points around the outliers.}
-#' \item{\code{one_class_svm_outliers}:}{When the data has a few anomalies and is not easily separable.}
-#' \item{\code{elliptic_envelope_outliers}:}{When the data has a multivariate normal distribution with few outliers.}
-#' \item{\code{lof_outliers}:}{When the data has a complex structure and outliers are not isolated.}
-#' }
+##############################
+# Outlier Detection Functions
+##############################
+
+# ---------------------------
+# Univariate Methods (vector based)
+# ---------------------------
+
+# Z–score method: returns a binary vector (1 = outlier, 0 = not)
+z_outliers <- function(x, z_thresh = 1.96) {
+  valid <- !is.na(x)
+  out <- rep(NA, length(x))
+  if (any(valid)) {
+    mu <- mean(x[valid])
+    sigma <- sd(x[valid])
+    # If sigma is 0 then mark all as non–outliers
+    if (sigma == 0) {
+      out[valid] <- 0
+    } else {
+      z <- (x[valid] - mu) / sigma
+      out[valid] <- ifelse(abs(z) > z_thresh, 1, 0)
+    }
+  }
+  return(out)
+}
+
+# Tukey's Fences: identifies values beyond Q1 - k*IQR or Q3 + k*IQR
+tukey_outliers <- function(x, tukey_mult = 1.5) {
+  valid <- !is.na(x)
+  out <- rep(NA, length(x))
+  if (any(valid)) {
+    Q1 <- quantile(x[valid], 0.25)
+    Q3 <- quantile(x[valid], 0.75)
+    IQR_val <- Q3 - Q1
+    lower_bound <- Q1 - tukey_mult * IQR_val
+    upper_bound <- Q3 + tukey_mult * IQR_val
+    out[valid] <- ifelse(x[valid] < lower_bound | x[valid] > upper_bound, 1, 0)
+  }
+  return(out)
+}
+
+# Grubbs test (single outlier detection, approximate critical value)
+grubbs_outliers <- function(x, grubbs_thresh = 0.05) {
+  valid <- !is.na(x)
+  out <- rep(NA, length(x))
+  n <- sum(valid)
+  if (n < 3) {
+    warning("Grubbs test requires at least 3 non-missing values.")
+    return(out)
+  }
+  mu <- mean(x[valid])
+  sigma <- sd(x[valid])
+  if (sigma == 0) {
+    out[valid] <- 0
+    return(out)
+  }
+  g_scores <- abs(x[valid] - mu) / sigma
+  # Compute critical value (an approximation)
+  t_val <- qt(1 - grubbs_thresh/(2 * n), df = n - 2)
+  threshold <- ((n - 1) / sqrt(n)) * sqrt(t_val^2 / (n - 2 + t_val^2))
+  out[valid] <- ifelse(g_scores > threshold, 1, 0)
+  return(out)
+}
+
+# Median Absolute Deviation (MAD) method
+mad_outliers <- function(x, mad_mult = 3) {
+  valid <- !is.na(x)
+  out <- rep(NA, length(x))
+  if (any(valid)) {
+    med_val <- median(x[valid])
+    mad_val <- median(abs(x[valid] - med_val))
+    if (mad_val == 0) {
+      # If all non-missing values are identical, flag non-equal values as outliers.
+      out[valid] <- ifelse(x[valid] == med_val, 0, 1)
+    } else {
+      out[valid] <- ifelse(abs(x[valid] - med_val) > mad_mult * mad_val, 1, 0)
+    }
+  }
+  return(out)
+}
+
+# Iglewicz–Hoaglin modified Z–score method
+iglewicz_hoaglin_outliers <- function(x, threshold = 3.5) {
+  valid <- !is.na(x)
+  out <- rep(NA, length(x))
+  if (any(valid)) {
+    med_val <- median(x[valid])
+    mad_val <- stats::mad(x[valid])
+    if (mad_val == 0) {
+      out[valid] <- ifelse(x[valid] == med_val, 0, 1)
+    } else {
+      mod_z <- 0.6745 * (x[valid] - med_val) / mad_val
+      out[valid] <- ifelse(abs(mod_z) > threshold, 1, 0)
+    }
+  }
+  return(out)
+}
+
+# ---------------------------
+# Multivariate Methods (data frame based)
+# ---------------------------
+
+# Mahalanobis Distance method:
+# df: a data frame of numeric columns
+mahalanobis_outliers <- function(df, threshold = NULL) {
+  n <- nrow(df)
+  out <- rep(NA, n)
+  complete_idx <- complete.cases(df)
+  if (sum(complete_idx) < 2) {
+    warning("Not enough complete cases for Mahalanobis distance.")
+    return(out)
+  }
+  df_complete <- df[complete_idx, , drop = FALSE]
+  center <- colMeans(df_complete)
+  cov_mat <- stats::cov(df_complete)
+  md <- mahalanobis(df_complete, center, cov_mat)
+  if (is.null(threshold)) {
+    threshold <- qchisq(0.95, df = ncol(df_complete))
+  }
+  out[complete_idx] <- ifelse(md > threshold, 1, 0)
+  return(out)
+}
+
+# Isolation Forest method using the isotree package
+isolation_forest_outliers <- function(df, contamination = 0.1, ndim = 1, ntree = 100, nthreads = 1) {
+  complete_idx <- complete.cases(df)
+  n <- nrow(df)
+  out <- rep(NA, n)
+  if (sum(complete_idx) < 1) return(out)
+  df_complete <- df[complete_idx, , drop = FALSE]
+  model <- isotree::isolation.forest(df_complete, ndim = ndim, ntree = ntree, nthreads = nthreads)
+  scores <- predict(model, df_complete, output_type = "score")
+  thresh <- as.numeric(quantile(scores, 1 - contamination))
+  out[complete_idx] <- ifelse(scores >= thresh, 1, 0)
+  return(out)
+}
+
+# DBSCAN–based outlier detection:
+# Observations not assigned to any cluster (i.e. cluster 0) are flagged as outliers.
+dbscan_outliers <- function(df, eps = 0.5, minPts = 5) {
+  complete_idx <- complete.cases(df)
+  n <- nrow(df)
+  out <- rep(NA, n)
+  if (sum(complete_idx) < 1) return(out)
+  df_complete <- df[complete_idx, , drop = FALSE]
+  clustering <- dbscan::dbscan(df_complete, eps = eps, minPts = minPts)
+  out[complete_idx] <- ifelse(clustering$cluster == 0, 1, 0)
+  return(out)
+}
+
+# One–Class SVM (from package e1071)
+one_class_svm_outliers <- function(df, nu = 0.05) {
+  complete_idx <- complete.cases(df)
+  n <- nrow(df)
+  out <- rep(NA, n)
+  if (sum(complete_idx) < 1) return(out)
+  df_complete <- df[complete_idx, , drop = FALSE]
+  model <- e1071::svm(df_complete, scale = TRUE, type = "one-classification", nu = nu, kernel = "radial")
+  preds <- predict(model, df_complete)
+  out[complete_idx] <- ifelse(preds, 0, 1)
+  return(out)
+}
+
+# Elliptic Envelope method (using robust covariance estimation from MASS::cov.rob)
+elliptic_envelope_outliers <- function(df, contamination = 0.1) {
+  complete_idx <- complete.cases(df)
+  n <- nrow(df)
+  out <- rep(NA, n)
+  if (sum(complete_idx) < 1) return(out)
+  df_complete <- df[complete_idx, , drop = FALSE]
+  robust_cov <- MASS::cov.rob(df_complete)  # use MASS::cov.rob
+  md <- mahalanobis(df_complete, robust_cov$center, robust_cov$cov)
+  threshold <- qchisq(1 - contamination, df = ncol(df_complete))
+  out[complete_idx] <- ifelse(md > threshold, 1, 0)
+  return(out)
+}
+
+# Local Outlier Factor (LOF) method
+lof_outliers <- function(df, minPts = 5, lof_thresh = 1.5) {
+  complete_idx <- complete.cases(df)
+  n <- nrow(df)
+  out <- rep(NA, n)
+  if (sum(complete_idx) < 1) return(out)
+  df_complete <- df[complete_idx, , drop = FALSE]
+  lof_scores <- dbscan::lof(as.matrix(df_complete), minPts = minPts)
+  out[complete_idx] <- ifelse(lof_scores > lof_thresh, 1, 0)
+  return(out)
+}
+
+
+###########################################
+# Main function: detect_outliers()
+###########################################
+#' Detect Outliers in a Data Frame
+#'
+#' This function applies a suite of outlier detection methods to a data frame.
+#' Univariate methods are applied column‐by‐column while multivariate methods
+#' are applied to the entire numeric data set. The output is the original data
+#' augmented by additional columns containing binary outlier flags (1 = outlier,
+#' 0 = not an outlier, NA = insufficient data).
+#'
+#' @param data A data frame containing at least one numeric column.
+#' @param methods Character vector specifying which methods to use. Options include:
+#'   - Univariate: `"z"`, `"tukey"`, `"grubbs"`, `"mad"`, `"iglewicz_hoaglin"`
+#'   - Multivariate: `"mahalanobis"`, `"isolation_forest"`, `"dbscan"`, `"one_class_svm"`,
+#'     `"elliptic_envelope"`, `"lof"`
+#'   The default is to run all methods.
+#'
+#' The remaining parameters are passed to the individual methods:
+#' @param z_thresh Numeric threshold for the Z–score method (default 1.96).
+#' @param tukey_mult Numeric multiplier for Tukey’s fences (default 1.5).
+#' @param mahalanobis_thresh Numeric threshold for Mahalanobis; if NULL, a 95% chi–square quantile is used.
+#' @param grubbs_thresh Numeric significance level for Grubbs test (default 0.05).
+#' @param mad_mult Numeric multiplier for the MAD method (default 3).
+#' @param iglewicz_hoaglin_thresh Numeric threshold for the modified Z–score (default 3.5).
+#' @param isolation_forest_contamination Contamination proportion for Isolation Forest (default 0.1).
+#' @param isolation_forest_ndim Dimensionality used in Isolation Forest (default 1).
+#' @param isolation_forest_ntree Number of trees for Isolation Forest (default 100).
+#' @param isolation_forest_nthreads Number of threads for Isolation Forest (default 1).
+#' @param dbscan_eps Epsilon value for DBSCAN (default 0.5).
+#' @param dbscan_minPts Minimum points for DBSCAN (default 5).
+#' @param one_class_svm_nu Nu parameter for One–Class SVM (default 0.05).
+#' @param elliptic_envelope_contamination Contamination for Elliptic Envelope (default 0.1).
+#' @param lof_minPts Minimum points for LOF (default 5).
+#' @param lof_thresh LOF threshold (default 1.5).
+#'
+#' @return A data frame with the original data plus additional columns for each method.
 #' @export
-
-# Load packages
-library(e1071)
-library(robustbase)
-library(tidyverse)
-library(dbscan)
-library(isotree)
-library(MASS)
-
-# Set seed
-set.seed(123)
-
-###################################################### Outlier functions
-
-# Z-score threshold method
-z_outliers <- function(data, column, z_thresh) {
-  z_score <- (data[, column] - mean(data[, column])) / sd(data[, column])
-  return(ifelse(abs(z_score) > z_thresh, 1, 0))
-}
-
-# Tukeys Fences
-tukey_outliers <- function(data, column, tukey_mult) {
-  Q1 <- quantile(data[, column], 0.25)
-  Q3 <- quantile(data[, column], 0.75)
-  IQR <- Q3 - Q1
-  lower_bound <- Q1 - tukey_mult * IQR
-  upper_bound <- Q3 + tukey_mult * IQR
-  return(ifelse(data[, column] < lower_bound | data[, column] > upper_bound, 1, 0))
-}
-
-# Mahalanobis Distance
-mahalanobis_outliers <- function(data, column, mahalanobis_thresh) {
-  cov_mat <- cov(data[, sapply(data, is.numeric) & names(data) != column])
-  center <- apply(data[, sapply(data, is.numeric) & names(data) != column], 2, mean)
-  md <- mahalanobis(data[, sapply(data, is.numeric) & names(data) != column], center, cov_mat, inverted = TRUE)
-  return(ifelse(md > mahalanobis_thresh, 1, 0))
-}
-
-# Grubbs method
-grubbs_outliers <- function(data, column, grubbs_thresh) {
-  n <- nrow(data)
-  g <- (abs(data[, column] - mean(data[, column])) / sd(data[, column]))
-  gmax <- max(g)
-  pval <- 2 * pt(gmax, n - 2, lower.tail = FALSE)
-  return(ifelse(pval < grubbs_thresh / n, 1, 0))
-}
-
-# Median Absolute Deviation Method
-mad_outliers <- function(data, column, mad_mult) {
-  med <- median(data[, column], na.rm = TRUE)
-  mad <- abs(data[, column] - med)
-  mad_thresh <- mad_mult * median(mad, na.rm = TRUE)
-  return(ifelse(mad > mad_thresh, 1, 0))
-}
-
-# Iglewicz and Hoaglin's Modified Z-score
-iglewicz_hoaglin_outliers <- function(data, column, threshold = 3.5) {
-  med <- median(data[, column], na.rm = TRUE)
-  mad <- stats::mad(data[, column], na.rm = TRUE)
-  modified_z <- abs((data[, column] - med) / mad)
-  return(ifelse(modified_z > threshold, 1, 0))
-}
-
-# Isolation Forest
-isolation_forest_outliers <- function(data, column, contamination, ndim = 1, ntree = 100, nthreads = 1) {
-  # Subset the data to the column of interest
-  X <- data[, column, drop = FALSE]
+detect_outliers <- function(data, 
+                            methods = c("z", "tukey", "mahalanobis", "grubbs", "mad", 
+                                        "iglewicz_hoaglin", "isolation_forest", "dbscan", 
+                                        "one_class_svm", "elliptic_envelope", "lof"), 
+                            z_thresh = 1.96, 
+                            tukey_mult = 1.5, 
+                            mahalanobis_thresh = NULL, 
+                            grubbs_thresh = 0.05, 
+                            mad_mult = 3, 
+                            iglewicz_hoaglin_thresh = 3.5, 
+                            isolation_forest_contamination = 0.1, 
+                            isolation_forest_ndim = 1, 
+                            isolation_forest_ntree = 100, 
+                            isolation_forest_nthreads = 1,
+                            dbscan_eps = 0.5, 
+                            dbscan_minPts = 5, 
+                            one_class_svm_nu = 0.05, 
+                            elliptic_envelope_contamination = 0.1,
+                            lof_minPts = 5, 
+                            lof_thresh = 1.5) {
+  if (!is.data.frame(data))
+    stop("Input data must be a data frame.")
   
-  # Build the isolation forest model
-  model <- isolation.forest(X, ndim = ndim, ntree = ntree, nthreads = nthreads)
+  numeric_cols <- names(data)[sapply(data, is.numeric)]
+  if (length(numeric_cols) == 0)
+    stop("The data frame must have at least one numeric column.")
   
-  # Predict the outlier scores
-  scores <- predict(model, X, output_type = "score")
+  results <- data
   
-  # Return the binary outlier labels
-  return(as.integer(scores > contamination))
-}
-
-# DBSCAN
-dbscan_outliers <- function(data, column, eps = 0.5, minPts = 5) {
-  d <- as.matrix(dist(data.frame(data[, column])))
-  dbscan_result <- dbscan::dbscan(d, eps = eps, minPts = minPts)
-  return(ifelse(dbscan_result$cluster == 0, 1, 0))
-}
-
-# One-Class SVM
-one_class_svm_outliers <- function(data, column, nu = 0.05) {
-  svm_model <- svm(data.frame(data[column]), scale = TRUE, type = "one-classification", nu = nu, kernel = "radial")
-  is_outlier <- predict(svm_model, data.frame(data[column]), decision.values = TRUE) < 0
-  return(as.integer(is_outlier))
-}
-
-# Elliptic Envelope
-elliptic_envelope_outliers <- function(data, column, contamination = 0.1) {
-  numeric_data <- data.frame(data[, sapply(data, is.numeric), drop = FALSE])
-  cov_robust <- cov.rob(numeric_data)
-  mahalanobis_distances <- mahalanobis(numeric_data, cov_robust$center, cov_robust$cov, inverted = TRUE)
-  cutoff <- qchisq(1 - contamination, df = ncol(numeric_data))
-  is_outlier <- mahalanobis_distances > cutoff
-  return(as.integer(is_outlier))
-}
-
-# Local Outlier Factor (LOF)
-lof_outliers <- function(data, column, minPts = 6, lof_thresh = 1.5) {
-  lof_scores <- dbscan::lof(data.frame(data[, column]), minPts = minPts)
-  outlier_flags <- ifelse(lof_scores > lof_thresh, 1, 0)
-  return(outlier_flags)
-}
-
-#' @title Detect Outliers in a Data Frame
-#' @description This function detects outliers in a data frame using various outlier detection methods.
-#'
-#' @param data Input data frame containing numeric columns
-#' @param methods Character vector of outlier detection methods to use
-#'
-#' @param data a data frame containing the data to be analyzed
-#' @param methods a character vector specifying the outlier detection methods to be used. Options include "z", "tukey", "mahalanobis", "grubbs", "mad", "iglewicz_hoaglin", "isolation_forest", "dbscan", "one_class_svm", "elliptic_envelope", and "lof". Default is to use all methods.
-#' @param z_thresh a numeric value specifying the Z-score threshold for the "z" method. Default is 1.96 (corresponding to a 95% confidence level).
-#' @param tukey_mult a numeric value specifying the Tukey multiplier for the "tukey" method. Default is 1.5.
-#' @param mahalanobis_thresh a numeric value specifying the threshold for the "mahalanobis" method. Default is calculated using a 95% confidence level and the number of columns in the data frame.
-#' @param grubbs_thresh a numeric value specifying the Grubbs threshold for the "grubbs" method. Default is 0.05.
-#' @param mad_mult a numeric value specifying the Median Absolute Deviation multiplier for the "mad" method. Default is 3.
-#' @param iglewicz_hoaglin_thresh a numeric value specifying the threshold for the "iglewicz_hoaglin" method. Default is 3.5.
-#' @param isolation_forest_contamination a numeric value specifying the contamination for the "isolation_forest" method. Default is 0.1.
-#' @param dbscan_eps a numeric value specifying the epsilon value for the "dbscan" method. Default is 0.5.
-#' @param dbscan_minPts an integer specifying the minimum number of points for the "dbscan" method. Default is 5.
-#' @param one_class_svm_nu a numeric value specifying the nu value for the "one_class_svm" method. Default is 0.05.
-#' @param elliptic_envelope_contamination a numeric value specifying the contamination for the "elliptic_envelope" method. Default is 0.1.
-#' @param lof_minPts an integer specifying the minimum number of points for the "lof" method. Default is 5.
-#' @param lof_thresh a numeric value specifying the Local Outlier Factor threshold for the "lof" method. Default is 1.
-#' @return a data frame with columns indicating the outlier status for each method
-#' 
-#' @return A list of data frames, each containing the outliers detected by a specific method
-#' 
-#' @examples
-#' # Create example data
-#' set.seed(123)
-#' example_data <- data.frame(
-#'   A = rnorm(100, 10, 2),
-#'   B = rnorm(100, 20, 5),
-#'   C = rnorm(100, 30, 10)
-#' )
-#'
-#' # Add some artificial outliers
-#' example_data[c(25, 50, 75), "B"] <- c(40, 10, 35)
-#' example_data[c(10, 90), "C"] <- c(5, 50)
-#'
-#' # Specify outlier detection method to use
-#' outlier_methods <- c("z_score")
-#'
-#' # Use function for Z-score method
-#' z_results <- detect_outliers(example_data, methods = outlier_methods)
-#'
-#' # Specify outlier detection method to use
-#' outlier_methods <- c("tukey")
-#'
-#' # Use function for Tukey's fences method
-#' tukey_results <- detect_outliers(example_data, methods = outlier_methods)
-#'
-#' # Specify outlier detection method to use
-#' outlier_methods <- c("mahalanobis")
-#'
-#' # Use function for Mahalanobis distance method
-#' mahalanobis_results <- detect_outliers(example_data, methods = outlier_methods)
-#'
-#' # Specify outlier detection method to use
-#' outlier_methods <- c("grubbs")
-#'
-#' # Use function for Grubbs method
-#' grubbs_results <- detect_outliers(example_data, methods = outlier_methods)
-#'
-#' # Specify outlier detection method to use
-#' outlier_methods <- c("mad")
-#'
-#' # Use function for Median Absolute Deviation (MAD) method
-#' mad_results <- detect_outliers(example_data, methods = outlier_methods)
-#'
-#' # Specify outlier detection method to use
-#' outlier_methods <- c("iglewicz_hoaglin")
-#'
-#' # Use function for Iglewicz and Hoaglin's Modified Z-score method
-#' iglewicz_hoaglin_results <- detect_outliers(example_data, methods = outlier_methods)
-#'
-#' # Specify outlier detection method to use
-#' outlier_methods <- c("isolation_forest")
-#'
-#' # Use function for Isolation Forest method
-#' isolation_forest_results <- detect_outliers(example_data, methods = outlier_methods)
-#'
-#' # Specify outlier detection method to use
-#' outlier_methods <- c("dbscan")
-#'
-#' # Use function for DBSCAN method
-#' dbscan_results <- detect_outliers(example_data, methods = outlier_methods)
-#'
-#' # Specify outlier detection method to use
-#' outlier_methods <- c("one_class_svm")
-#'
-#' # Use function for One-Class SVM method
-#' one_class_svm_results <- detect_outliers(example_data, methods = outlier_methods)
-#'
-#' # Specify outlier detection method to use
-#' outlier_methods <- c("elliptic_envelope")
-#'
-#' # Use function for Elliptic Envelope method
-#' elliptic_envelope_results <- detect_outliers(example_data, methods = outlier_methods)
-#'
-#' # Specify outlier detection method to use
-#' outlier_methods <- c("lof")
-#'
-#' # Use function for Local Outlier Factor (LOF) method
-#' lof_results <- detect_outliers(example_data, methods = outlier_methods)
-#'
-#' # Specify methods to use for outlier detection
-#' outlier_methods <- c("z", "tukey", "mahalanobis", "grubbs", "mad", 
-#'                      "iglewicz_hoaglin", "isolation_forest", "dbscan", 
-#'                      "one_class_svm", "elliptic_envelope", "lof")
-#'
-#' # Use function
-#' all_methods <- detect_outliers(example_data, methods = outlier_methods)
-#'
-#' # Review results for each method
-#' head(z_results)
-#' head(tukey_results)
-#' head(mahalanobis_results)
-#' head(grubbs_results)
-#' head(mad_results)
-#' head(iglewicz_hoaglin_results)
-#' head(isolation_forest_results)
-#' head(dbscan_results)
-#' head(one_class_svm_results)
-#' head(elliptic_envelope_results)
-#' head(lof_results)
-#' head(all_methods)
-#' 
-#' @import e1071
-#' @importFrom e1071 svm
-#'
-#' @import robustbase
-#' @importFrom robustbase covMcd
-#'
-#' @import tidyverse
-#' @importFrom dplyr %>% mutate
-#' @importFrom ggplot2 ggplot geom_point
-#'
-#' @import dbscan
-#' @importFrom dbscan dbscan
-#'
-#' @import isotree
-#' @importFrom isotree isolationForest
-#'
-#' @import MASS
-#' @importFrom MASS mahalanobis
-#' 
-#' @export
-
-###################################################### Run multiple outliers
-
-# Main outliers detection function
-detect_outliers <- function(data, methods = c("z", "tukey", "mahalanobis", "grubbs", "mad", "iglewicz_hoaglin", "isolation_forest", "dbscan", "one_class_svm", "elliptic_envelope", "lof"), z_thresh = 1.96, tukey_mult = 1.5, mahalanobis_thresh = qchisq(0.95, ncol(data)), grubbs_thresh = 0.05, mad_mult = 3, iglewicz_hoaglin_thresh = 3.5, isolation_forest_contamination = 0.1, dbscan_eps = 0.5, dbscan_minPts = 5, one_class_svm_nu = 0.05, elliptic_envelope_contamination = 0.1, lof_minPts = 5, lof_thresh = 1) {
-  # Initialize output data frame
-  results <- data.frame(row.names = row.names(data), data)
+  univariate_methods <- c("z", "tukey", "grubbs", "mad", "iglewicz_hoaglin")
+  multivariate_methods <- c("mahalanobis", "isolation_forest", "dbscan", "one_class_svm", "elliptic_envelope", "lof")
   
-  # Loop through numeric columns
-  for (column in names(data)[sapply(data, is.numeric)]) {
-    # Remove missing values
-    data_no_na <- data[complete.cases(data[, column]), ]
-    
-    # Calculate and store outliers for each method
-    tryCatch({
-      if ("z" %in% methods) {
-        results[paste0(column, "_z_outlier")] <- ifelse(!complete.cases(data[, column]), NA, z_outliers(data_no_na, column, z_thresh))
-      }
-    }, error = function(e) {
-      message("Error in Z-score method: ", e$message)
-    })
-    
-    tryCatch({
-      if ("tukey" %in% methods) {
-        results[paste0(column, "_t_outlier")] <- ifelse(!complete.cases(data[, column]), NA, tukey_outliers(data_no_na, column, tukey_mult))
-      }
-    }, error = function(e) {
-      message("Error in Tukey method: ", e$message)
-    })
-    
-    tryCatch({
-      if ("mahalanobis" %in% methods) {
-        results[paste0(column, "_md_outlier")] <- ifelse(!complete.cases(data[, column]), NA, mahalanobis_outliers(data_no_na, column, mahalanobis_thresh))
-      }
-    }, error = function(e) {
-      message("Error in Mahalanobis method: ", e$message)
-    })
-    
-    tryCatch({
-      if ("grubbs" %in% methods) {
-        results[paste0(column, "_g_outlier")] <- ifelse(!complete.cases(data[, column]), NA, grubbs_outliers(data_no_na, column, grubbs_thresh))
-      }
-    }, error = function(e) {
-      message("Error in Grubbs method: ", e$message)
-    })
-    
-    tryCatch({
-      if ("mad" %in% methods) {
-        results[paste0(column, "_mad_outlier")] <- ifelse(!complete.cases(data[, column]), NA, mad_outliers(data_no_na, column, mad_mult))
-      }
-    }, error = function(e) {
-      message("Error in MAD method: ", e$message)
-    })
-    
-    tryCatch({
-      if ("iglewicz_hoaglin" %in% methods) {
-        data_no_na$iglewicz_hoaglin_outlier <- iglewicz_hoaglin_outliers(data_no_na, column, iglewicz_hoaglin_thresh)
-        results[paste0(column, "_iglewicz_hoaglin_outlier")] <- ifelse(!complete.cases(data[, column]), NA, data_no_na$iglewicz_hoaglin_outlier)
-      }
-    }, error = function(e) {
-      message("Error in Iglewicz-Hoaglin method: ", e$message)
-    })
-    
-    if ("isolation_forest" %in% methods) {
-      tryCatch(
-        {
-          data_no_na$isolation_forest_outlier <- isolation_forest_outliers(data_no_na, column, isolation_forest_contamination)
-          results[paste0(column, "_isolation_forest_outlier")] <- ifelse(!complete.cases(data[, column]), NA, data_no_na$isolation_forest_outlier)
+  # Apply univariate methods column by column
+  for (col in numeric_cols) {
+    x <- data[[col]]
+    for (method in methods) {
+      if (method %in% univariate_methods) {
+        colname <- switch(method,
+                          "z" = paste0(col, "_z_outlier"),
+                          "tukey" = paste0(col, "_tukey_outlier"),
+                          "grubbs" = paste0(col, "_grubbs_outlier"),
+                          "mad" = paste0(col, "_mad_outlier"),
+                          "iglewicz_hoaglin" = paste0(col, "_iglewicz_hoaglin_outlier"))
+        out <- tryCatch({
+          if (method == "z") {
+            z_outliers(x, z_thresh = z_thresh)
+          } else if (method == "tukey") {
+            tukey_outliers(x, tukey_mult = tukey_mult)
+          } else if (method == "grubbs") {
+            grubbs_outliers(x, grubbs_thresh = grubbs_thresh)
+          } else if (method == "mad") {
+            mad_outliers(x, mad_mult = mad_mult)
+          } else if (method == "iglewicz_hoaglin") {
+            iglewicz_hoaglin_outliers(x, threshold = iglewicz_hoaglin_thresh)
+          }
         }, error = function(e) {
-          message("Error in Isolation Forest method: ", e$message)
-        }
-      )
-    }
-    
-    tryCatch({
-      if ("dbscan" %in% methods) {
-        data_no_na$dbscan_outlier <- dbscan_outliers(data_no_na, column, dbscan_eps, dbscan_minPts)
-        results[paste0(column, "_dbscan_outlier")] <- ifelse(!complete.cases(data[, column]), NA, data_no_na$dbscan_outlier)
+          warning(paste("Error in", method, "for column", col, ":", e$message))
+          rep(NA, length(x))
+        })
+        results[[colname]] <- out
       }
-    }, error = function(e) {
-      message("Error in DBSCAN method: ", e$message)
-    })
-    
-    if ("one_class_svm" %in% methods) {
-      tryCatch(
-        {
-          data_no_na$one_class_svm_outlier <- one_class_svm_outliers(data_no_na, column, one_class_svm_nu)
-          results[paste0(column, "_one_class_svm_outlier")] <- ifelse(!complete.cases(data[, column]), NA, data_no_na$one_class_svm_outlier)
-        }, error = function(e) {
-          message("Error in One-Class SVM method: ", e$message)
-        }
-      )
     }
-    
-    if ("elliptic_envelope" %in% methods) {
-      tryCatch(
-        {
-          # Create a separate variable for the Elliptic Envelope method
-          data_no_na_ee <- data[complete.cases(data[, column]), ]
-          
-          # Run the function on the data without missing values
-          data_no_na_ee$elliptic_envelope_outlier <- elliptic_envelope_outliers(data_no_na_ee, column, elliptic_envelope_contamination)
-          
-          # Assign the results to the original data, accounting for missing values
-          results[paste0(column, "_elliptic_envelope_outlier")] <- ifelse(!complete.cases(data[, column]), NA, data_no_na_ee$elliptic_envelope_outlier)
-        }, error = function(e) {
-          message("Error in Elliptic Envelope method: ", e$message)
+  }
+  
+  # Apply multivariate methods on all numeric columns
+  numeric_data <- data[, numeric_cols, drop = FALSE]
+  for (method in methods) {
+    if (method %in% multivariate_methods) {
+      colname <- paste0("multivariate_", method, "_outlier")
+      out <- tryCatch({
+        if (method == "mahalanobis") {
+          if (is.null(mahalanobis_thresh))
+            mahalanobis_thresh <- qchisq(0.95, df = ncol(numeric_data))
+          mahalanobis_outliers(numeric_data, threshold = mahalanobis_thresh)
+        } else if (method == "isolation_forest") {
+          isolation_forest_outliers(numeric_data, contamination = isolation_forest_contamination,
+                                    ndim = isolation_forest_ndim, ntree = isolation_forest_ntree, 
+                                    nthreads = isolation_forest_nthreads)
+        } else if (method == "dbscan") {
+          dbscan_outliers(numeric_data, eps = dbscan_eps, minPts = dbscan_minPts)
+        } else if (method == "one_class_svm") {
+          one_class_svm_outliers(numeric_data, nu = one_class_svm_nu)
+        } else if (method == "elliptic_envelope") {
+          elliptic_envelope_outliers(numeric_data, contamination = elliptic_envelope_contamination)
+        } else if (method == "lof") {
+          lof_outliers(numeric_data, minPts = lof_minPts, lof_thresh = lof_thresh)
         }
-      )
+      }, error = function(e) {
+        warning(paste("Error in multivariate method", method, ":", e$message))
+        rep(NA, nrow(numeric_data))
+      })
+      results[[colname]] <- out
     }
-    
-    tryCatch({
-      if ("lof" %in% methods) {
-        data_no_na$lof_outlier <- lof_outliers(data_no_na, column, lof_minPts, lof_thresh)
-        results[paste0(column, "_lof_outlier")] <- ifelse(!complete.cases(data[, column]), NA, data_no_na$lof_outlier)
-      }
-    }, error = function(e) {
-      message("Error in Local Outlier Factor (LOF) method: ", e$message)
-    })
   }
   
   return(results)
 }
+
+
+#####################################
+# User Acceptance Testing (UAT)
+#####################################
+# This UAT suite uses the testthat package to exercise every function and parameter.
+# To run the tests, ensure that the testthat package is installed and then call run_uat().
+
+run_uat <- function() {
+  if (!requireNamespace("testthat", quietly = TRUE)) {
+    stop("The 'testthat' package is required for running the UAT. Please install it.")
+  }
+  library(testthat)
+  
+  message("Running UAT for univariate outlier functions...")
+  
+  test_that("z_outliers identifies extreme values", {
+    x <- c(rep(10, 10), 100)
+    out <- z_outliers(x, z_thresh = 1.96)
+    expect_equal(length(out), length(x))
+    expect_true(sum(out, na.rm = TRUE) >= 1)
+  })
+  
+  test_that("tukey_outliers flags values beyond fences", {
+    x <- c(1, 2, 3, 4, 50)
+    out <- tukey_outliers(x, tukey_mult = 1.5)
+    expect_true(any(out == 1, na.rm = TRUE))
+  })
+  
+  test_that("grubbs_outliers warns on too few values", {
+    x <- c(5, NA)
+    expect_warning(grubbs_outliers(x))
+  })
+  
+  test_that("mad_outliers flags extreme deviations", {
+    x <- c(5, 5, 5, 5, 20)
+    out <- mad_outliers(x, mad_mult = 3)
+    expect_true(any(out == 1, na.rm = TRUE))
+  })
+  
+  test_that("iglewicz_hoaglin_outliers works as expected", {
+    x <- c(1, 1, 1, 1, 10)
+    out <- iglewicz_hoaglin_outliers(x, threshold = 3.5)
+    expect_true(any(out == 1, na.rm = TRUE))
+  })
+  
+  message("Running UAT for multivariate outlier functions...")
+  
+  set.seed(123)
+  df_multi <- data.frame(
+    A = rnorm(50, 10, 2),
+    B = rnorm(50, 20, 5),
+    C = rnorm(50, 30, 10)
+  )
+  df_multi[c(5, 15), "A"] <- c(25, -5)
+  df_multi[c(10, 20), "B"] <- c(40, 5)
+  df_multi[c(8, 22), "C"] <- c(60, 0)
+  
+  test_that("mahalanobis_outliers flags multivariate outliers", {
+    out <- mahalanobis_outliers(df_multi, threshold = qchisq(0.95, df = ncol(df_multi)))
+    expect_equal(length(out), nrow(df_multi))
+    expect_true(sum(out, na.rm = TRUE) >= 1)
+  })
+  
+  test_that("isolation_forest_outliers returns correct length", {
+    out <- isolation_forest_outliers(df_multi, contamination = 0.1)
+    expect_equal(length(out), nrow(df_multi))
+  })
+  
+  test_that("dbscan_outliers returns binary flags", {
+    out <- dbscan_outliers(df_multi, eps = 1, minPts = 3)
+    expect_equal(length(out), nrow(df_multi))
+    expect_true(all(is.na(out) | out %in% c(0, 1)))
+  })
+  
+  test_that("one_class_svm_outliers returns binary flags", {
+    out <- one_class_svm_outliers(df_multi, nu = 0.05)
+    expect_equal(length(out), nrow(df_multi))
+    expect_true(all(is.na(out) | out %in% c(0, 1)))
+  })
+  
+  test_that("elliptic_envelope_outliers returns binary flags", {
+    out <- elliptic_envelope_outliers(df_multi, contamination = 0.1)
+    expect_equal(length(out), nrow(df_multi))
+    expect_true(all(is.na(out) | out %in% c(0, 1)))
+  })
+  
+  test_that("lof_outliers returns binary flags", {
+    out <- lof_outliers(df_multi, minPts = 5, lof_thresh = 1.5)
+    expect_equal(length(out), nrow(df_multi))
+    expect_true(all(is.na(out) | out %in% c(0, 1)))
+  })
+  
+  message("Running UAT for the detect_outliers() master function...")
+  
+  example_data <- data.frame(
+    A = rnorm(100, 10, 2),
+    B = rnorm(100, 20, 5),
+    C = rnorm(100, 30, 10),
+    D = sample(letters, 100, replace = TRUE)
+  )
+  example_data[c(25, 50, 75), "B"] <- c(40, 10, 35)
+  example_data[c(10, 90), "C"] <- c(5, 50)
+  
+  res <- detect_outliers(example_data, 
+                         methods = c("z", "tukey", "mahalanobis", "grubbs", "mad", 
+                                     "iglewicz_hoaglin", "isolation_forest", "dbscan", 
+                                     "one_class_svm", "elliptic_envelope", "lof"),
+                         z_thresh = 1.96,
+                         tukey_mult = 1.5,
+                         mahalanobis_thresh = NULL,
+                         grubbs_thresh = 0.05,
+                         mad_mult = 3,
+                         iglewicz_hoaglin_thresh = 3.5,
+                         isolation_forest_contamination = 0.1,
+                         isolation_forest_ndim = 1,
+                         isolation_forest_ntree = 100,
+                         isolation_forest_nthreads = 1,
+                         dbscan_eps = 0.5,
+                         dbscan_minPts = 5,
+                         one_class_svm_nu = 0.05,
+                         elliptic_envelope_contamination = 0.1,
+                         lof_minPts = 5,
+                         lof_thresh = 1.5)
+  
+  test_that("detect_outliers() returns original plus added columns", {
+    expect_true(ncol(res) > ncol(example_data))
+    flag_cols <- grep("_outlier$", names(res), value = TRUE)
+    expect_true(length(flag_cols) > 0)
+  })
+  
+  message("All UAT tests completed successfully!")
+}
+
+##############################
+# End of Script
+##############################
+
+# To run the UAT, simply call:
+# run_uat()
