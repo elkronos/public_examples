@@ -1,418 +1,678 @@
-library(caret)   # For data partitioning and dummy variables
-library(mice)    # For missing data imputation
-library(dplyr)   # For data manipulation
-library(ranger)  # For Random Forest models in feature selection
-library(magrittr) # For the pipe operator `%>%`
+# Global debug flag and logger function
+DEBUG <- TRUE
+log_debug <- function(fmt, ...) {
+  if (DEBUG) {
+    cat(sprintf(paste0("[DEBUG] ", fmt, "\n"), ...))
+  }
+}
 
-#' Impute Missing Data in a Dataset
-#'
-#' This function imputes missing data in a given dataset using the MICE (Multiple Imputation by Chained Equations) package. It automatically selects the imputation method for each variable in the dataset based on its data type: 'mean' for numeric variables and 'logreg' (logistic regression) for factor variables. 
-#'
-#' @param data A data frame or matrix containing the data with missing values.
-#' @param method The imputation method to be applied. Default is 'pmm' (predictive mean matching). This parameter is passed to the `mice` function from the MICE package. Optional.
-#'
-#' @importFrom mice mice
-#' @importFrom mice complete
-#'
-#' @return A data frame or matrix with missing values imputed.
-#'
-#' @examples
-#' \dontrun{
-#'   data_with_missing <- data.frame(
-#'     a = c(1, NA, 3, 4, 5),
-#'     b = factor(c("yes", "no", NA, "yes", "no"))
-#'   )
-#'   imputed_data <- impute_missing_data(data_with_missing)
-#' }
-#'
-#' @export
-impute_missing_data <- function(data, method = 'pmm') {
-  methods <- sapply(data, function(x) {
-    if (is.numeric(x)) {
-      return('mean')
-    } else if (is.factor(x)) {
-      return('logreg')
+# Load required packages
+library(caret)      # For data partitioning and dummyVars
+library(mice)       # For missing data imputation (and parallel version)
+library(dplyr)      # For data manipulation
+library(ranger)     # For random forest (used in feature selection and tuning)
+library(magrittr)   # For the pipe operator
+library(parallel)   # For parallel processing (for parlmice)
+library(Boruta)     # For Boruta feature selection
+library(glmnet)     # For LASSO feature selection
+
+### ============================================================
+### Helper: Remove Constant or Nearly Constant Columns
+### ============================================================
+remove_constant_columns <- function(data, tol_var = 1e-6) {
+  log_debug("Checking for constant/nearly constant columns (tol_var=%.1e).", tol_var)
+  removed <- list()
+  keep <- c()
+  for (col in names(data)) {
+    vec <- data[[col]]
+    if (is.numeric(vec)) {
+      var_val <- var(vec, na.rm = TRUE)
+      if (is.na(var_val) || var_val < tol_var) {
+        const_val <- mean(vec, na.rm = TRUE)
+        removed[[col]] <- const_val
+        log_debug("Numeric column '%s' is nearly constant (variance=%.3e); value=%.3f.", 
+                  col, var_val, const_val)
+      } else {
+        keep <- c(keep, col)
+      }
     } else {
-      return('')
+      unique_vals <- unique(vec[!is.na(vec)])
+      if (length(unique_vals) < 2) {
+        removed[[col]] <- unique_vals
+        log_debug("Column '%s' is constant (value: %s).", col, paste(unique_vals, collapse = ","))
+      } else {
+        keep <- c(keep, col)
+      }
+    }
+  }
+  new_data <- data[, keep, drop = FALSE]
+  list(new_data = new_data, removed = removed)
+}
+
+### ============================================================
+### 1. Impute Missing Data (with Parallel Option and Fallback)
+### ============================================================
+impute_missing_data <- function(data,
+                                numeric_method = "pmm",
+                                binary_factor_method = "logreg",
+                                multiclass_factor_method = "polyreg",
+                                m = 5,
+                                maxit = 50,
+                                seed = 500,
+                                suppress_warnings = TRUE,
+                                parallel = FALSE,
+                                ncores = detectCores() - 1) {
+  log_debug("Starting impute_missing_data (parallel=%s)", parallel)
+  
+  # Remove constant/nearly constant columns.
+  rc <- remove_constant_columns(data, tol_var = 1e-6)
+  data_for_impute <- rc$new_data
+  removed_cols <- rc$removed
+  
+  methods <- sapply(data_for_impute, function(x) {
+    if (is.numeric(x)) {
+      return(numeric_method)
+    } else if (is.factor(x)) {
+      if (length(levels(x)) == 2) {
+        return(binary_factor_method)
+      } else {
+        return(multiclass_factor_method)
+      }
+    } else {
+      return("")
     }
   })
   
-  imputed_data <- mice::mice(data, m=5, maxit = 50, method = methods, seed = 500)
-  completed_data <- mice::complete(imputed_data, 1)
-  return(completed_data)
-}
-
-
-#' Scale Numeric Columns of a Data Frame
-#'
-#' This function scales numeric columns in a given data frame using a specified method.
-#' The default scaling method is standardization (z-score scaling). It is designed to work
-#' with data frames where some columns are numeric and others may not be. Only numeric
-#' columns are scaled.
-#'
-#' @param data A data frame containing the data to be scaled. This parameter is required.
-#' @param method A character string specifying the scaling method. Currently supports
-#'   only 'standard' for z-score standardization. Default is 'standard'.
-#'
-#' @return A data frame with numeric columns scaled according to the specified method.
-#'
-#' @importFrom stats scale
-#' @export
-#'
-#' @examples
-#' \dontrun{
-#'   # Example dataset
-#'   data <- data.frame(a = 1:10, b = rnorm(10))
-#'   # Scale the data
-#'   scaled_data <- scale_data(data)
-#' }
-#'
-#' @references
-#' The scaling is performed using the `scale` function from the 'stats' package.
-#'
-scale_data <- function(data, method = 'standard') {
-  numeric_columns <- sapply(data, is.numeric)
-  if (method == 'standard') {
-    data[numeric_columns] <- lapply(data[numeric_columns], scale)
-  }
-  return(data)
-}
-
-
-#' One-Hot Encode Data
-#'
-#' This function performs one-hot encoding on a given dataset. One-hot encoding 
-#' is a process of converting categorical variables into a form that could be 
-#' provided to machine learning algorithms to improve predictions. It uses the 
-#' `dummyVars` function from the `caret` package to create dummy variables for 
-#' categorical features in the dataset and then converts the result to a dataframe.
-#'
-#' @param data A dataframe containing the data to be one-hot encoded. The function 
-#' expects this parameter to be provided, and there is no default value.
-#'
-#' @return A dataframe with one-hot encoded variables.
-#'
-#' @importFrom caret dummyVars
-#' @importFrom stats predict
-#' 
-#' @examples
-#' \dontrun{
-#'   # Assuming 'my_data' is your dataframe with categorical variables
-#'   encoded_data <- one_hot_encode(my_data)
-#' }
-#'
-#' @export
-one_hot_encode <- function(data) {
-  dummy_model <- caret::dummyVars("~ .", data = data)
-  data_encoded <- predict(dummy_model, newdata = data)
-  data_encoded <- as.data.frame(data_encoded)  # Convert to dataframe
-  return(data_encoded)
-}
-
-
-#' Remove Outliers from Numeric Columns in a Data Frame
-#'
-#' This function iterates over each numeric column in a given data frame and replaces outliers 
-#' with NA. An outlier is defined as a value that lies beyond the interquartile range (IQR) 
-#' multiplied by a specified multiplier. By default, the multiplier is set to 1.5.
-#' 
-#' @param data A data frame from which outliers will be removed. Required.
-#' @param multiplier A numeric value used to scale the IQR to determine outliers. 
-#'   Default is 1.5. Optional.
-#' 
-#' @return A data frame with outliers in numeric columns replaced by NA.
-#' 
-#' @importFrom stats quantile IQR
-#'
-#' @examples
-#' \dontrun{
-#'   data <- data.frame(a = rnorm(100), b = rnorm(100))
-#'   cleaned_data <- remove_outliers(data)
-#' }
-#'
-#' @export
-remove_outliers <- function(data, multiplier = 1.5) {
-  for (col in names(data)) {
-    if (is.numeric(data[[col]])) {
-      x <- data[[col]]
-      qnt <- quantile(x, probs=c(.25, .75), na.rm = T)
-      H <- multiplier * IQR(x, na.rm = T)
-      x[x < (qnt[1] - H) | x > (qnt[2] + H)] <- NA
-      data[[col]] <- x
+  set.seed(seed)
+  log_debug("Calling mice for imputation on %d columns.", ncol(data_for_impute))
+  mice_result <- try({
+    if (parallel) {
+      # Note: parlmice is deprecated; consider futuremice for production use.
+      cl <- makeCluster(ncores)
+      clusterEvalQ(cl, { library(mice) })
+      res <- parlmice(data_for_impute, m = m, maxit = maxit, method = methods, seed = seed, printFlag = FALSE, cluster = cl)
+      stopCluster(cl)
+      res
+    } else {
+      if (suppress_warnings) {
+        suppressWarnings(mice(data_for_impute, m = m, maxit = maxit, method = methods, seed = seed, printFlag = FALSE))
+      } else {
+        mice(data_for_impute, m = m, maxit = maxit, method = methods, seed = seed, printFlag = FALSE)
+      }
     }
-  }
-  return(data)
-}
-
-
-#' Generate Interaction Terms
-#'
-#' This function generates interaction terms for numeric columns in a given dataset.
-#' It creates pairwise interaction terms (product of pairs of columns) for all numeric columns.
-#' The degree of interaction is currently set to 2 (pairwise), and this function only
-#' works for numeric columns.
-#'
-#' @param data A dataframe containing the data for which interaction terms are to be generated.
-#' @param degree An integer specifying the degree of interaction, with a default value of 2.
-#'              Currently, only a degree of 2 is implemented, implying pairwise interactions.
-#'              This parameter is optional.
-#' @return A dataframe with the original data and added interaction terms.
-#'
-#' @importFrom stats setNames
-#' @importFrom base cbind
-#' @importFrom utils as.data.frame
-#'
-#' @examples
-#' \dontrun{
-#'   data <- data.frame(a = 1:3, b = 2:4, c = 3:5)
-#'   result <- generate_interaction_terms(data)
-#'   print(result)
-#' }
-generate_interaction_terms <- function(data, degree = 2) {
-  numeric_cols <- names(data)[sapply(data, is.numeric)]
-  interactions <- list()
+  }, silent = TRUE)
   
-  if (degree >= 2) {
-    for (i in 1:(length(numeric_cols) - 1)) {
-      for (j in (i + 1):length(numeric_cols)) {
-        new_col_name <- paste(numeric_cols[i], numeric_cols[j], sep = "_x_")
-        interactions[[new_col_name]] <- data[[numeric_cols[i]]] * data[[numeric_cols[j]]]
+  if (inherits(mice_result, "try-error")) {
+    log_debug("MICE imputation failed; using fallback imputation.")
+    complete_data <- data_for_impute
+    for (col in names(complete_data)) {
+      if (any(is.na(complete_data[[col]]))) {
+        if (is.numeric(complete_data[[col]])) {
+          replacement <- mean(complete_data[[col]], na.rm = TRUE)
+          log_debug("Fallback: Numeric column '%s', mean=%.3f", col, replacement)
+          complete_data[[col]][is.na(complete_data[[col]])] <- replacement
+        } else if (is.factor(complete_data[[col]])) {
+          tab <- table(complete_data[[col]])
+          mode_val <- names(tab)[which.max(tab)]
+          log_debug("Fallback: Factor column '%s', mode=%s", col, mode_val)
+          complete_data[[col]][is.na(complete_data[[col]])] <- mode_val
+        }
+      }
+    }
+  } else {
+    complete_data <- complete(mice_result, 1)
+  }
+  
+  # Post-process any remaining NAs
+  if (any(is.na(complete_data))) {
+    for (col in names(complete_data)) {
+      if (any(is.na(complete_data[[col]]))) {
+        if (is.numeric(complete_data[[col]])) {
+          replacement <- mean(complete_data[[col]], na.rm = TRUE)
+          log_debug("Post-process: Numeric column '%s', replacing NA with mean=%.3f", col, replacement)
+          complete_data[[col]][is.na(complete_data[[col]])] <- replacement
+        } else if (is.factor(complete_data[[col]])) {
+          tab <- table(complete_data[[col]])
+          mode_val <- names(tab)[which.max(tab)]
+          log_debug("Post-process: Factor column '%s', replacing NA with mode=%s", col, mode_val)
+          complete_data[[col]][is.na(complete_data[[col]])] <- mode_val
+        }
       }
     }
   }
   
+  # Reinsert constant/nearly constant columns.
+  if (length(removed_cols) > 0) {
+    for (col in names(removed_cols)) {
+      log_debug("Reinserting constant column '%s' with value: %s", col, paste(removed_cols[[col]], collapse = ","))
+      complete_data[[col]] <- rep(removed_cols[[col]], nrow(complete_data))
+    }
+  }
+  
+  log_debug("impute_missing_data complete.")
+  return(complete_data)
+}
+
+### ============================================================
+### 2. Scaling Functions
+### ============================================================
+fit_scaler <- function(data, scaling_method = "standard") {
+  log_debug("Starting fit_scaler with method=%s", scaling_method)
+  numeric_cols <- names(data)[sapply(data, is.numeric)]
+  if (scaling_method == "standard") {
+    params <- lapply(data[numeric_cols], function(x) {
+      list(mean = mean(x, na.rm = TRUE), sd = sd(x, na.rm = TRUE))
+    })
+  } else if (scaling_method == "minmax") {
+    params <- lapply(data[numeric_cols], function(x) {
+      list(min = min(x, na.rm = TRUE), max = max(x, na.rm = TRUE))
+    })
+  } else {
+    stop("Unsupported scaling_method. Use 'standard' or 'minmax'.")
+  }
+  log_debug("fit_scaler complete. Numeric columns: %s", paste(numeric_cols, collapse = ", "))
+  return(list(params = params, numeric_cols = numeric_cols, method = scaling_method))
+}
+
+apply_scaler <- function(data, scaler) {
+  log_debug("Starting apply_scaler with method=%s", scaler$method)
+  for (col in scaler$numeric_cols) {
+    log_debug("Processing column: %s", col)
+    if (col %in% names(data)) {
+      if (scaler$method == "standard") {
+        mean_val <- scaler$params[[col]]$mean
+        sd_val <- scaler$params[[col]]$sd
+        log_debug("Standard scaling for %s: mean=%.3f, sd=%.3f", col, mean_val, sd_val)
+        if (sd_val == 0) {
+          data[[col]] <- data[[col]] - mean_val
+        } else {
+          data[[col]] <- (data[[col]] - mean_val) / sd_val
+        }
+        log_debug("After standard scaling, %s: %s", col, paste(data[[col]], collapse = ", "))
+      } else if (scaler$method == "minmax") {
+        min_val <- scaler$params[[col]]$min
+        max_val <- scaler$params[[col]]$max
+        log_debug("Minmax scaling for %s: min=%.3f, max=%.3f", col, min_val, max_val)
+        if (max_val == min_val) {
+          data[[col]] <- data[[col]] - min_val
+        } else {
+          data[[col]] <- as.numeric((data[[col]] - min_val) / (max_val - min_val))
+        }
+        log_debug("After minmax scaling, %s: %s", col, paste(data[[col]], collapse = ", "))
+      }
+    }
+  }
+  log_debug("apply_scaler complete.")
+  return(data)
+}
+
+### ============================================================
+### 3. One–Hot Encoding
+### ============================================================
+fit_one_hot_encoder <- function(data, outcome_var, fullRank = FALSE) {
+  log_debug("Starting fit_one_hot_encoder (excluding outcome: %s)", outcome_var)
+  formula <- as.formula(paste("~ . -", outcome_var))
+  dummy_model <- caret::dummyVars(formula, data = data, fullRank = fullRank)
+  log_debug("fit_one_hot_encoder complete.")
+  return(dummy_model)
+}
+
+apply_one_hot_encoder <- function(data, dummy_model, outcome_var) {
+  log_debug("Starting apply_one_hot_encoder")
+  features_encoded <- predict(dummy_model, newdata = data)
+  features_encoded <- as.data.frame(features_encoded)
+  outcome <- data[[outcome_var]]
+  result <- cbind(features_encoded, outcome)
+  names(result)[ncol(result)] <- outcome_var
+  log_debug("apply_one_hot_encoder complete.")
+  return(result)
+}
+
+### ============================================================
+### 4. Outlier Removal
+### ============================================================
+fit_outlier_removal <- function(data, multiplier = 1.5) {
+  log_debug("Starting fit_outlier_removal with multiplier=%.3f", multiplier)
+  numeric_cols <- names(data)[sapply(data, is.numeric)]
+  thresholds <- list()
+  for (col in numeric_cols) {
+    x <- data[[col]]
+    qnt <- quantile(x, probs = c(0.25, 0.75), na.rm = TRUE, type = 7)
+    IQR_val <- qnt[2] - qnt[1]
+    H <- multiplier * IQR_val
+    lower_threshold <- qnt[1] - H
+    upper_threshold <- qnt[2] + H
+    thresholds[[col]] <- structure(c(lower_threshold, upper_threshold), names = c("lower", "upper"))
+    log_debug("Column '%s': Q1=%.3f, Q3=%.3f, IQR=%.3f, H=%.3f, Lower=%.3f, Upper=%.3f",
+              col, qnt[1], qnt[2], IQR_val, H, lower_threshold, upper_threshold)
+  }
+  log_debug("fit_outlier_removal complete.")
+  return(thresholds)
+}
+
+apply_outlier_removal <- function(data, thresholds) {
+  log_debug("Starting apply_outlier_removal")
+  for (col in names(thresholds)) {
+    if (col %in% names(data) && is.numeric(data[[col]])) {
+      lower <- thresholds[[col]]["lower"]
+      upper <- thresholds[[col]]["upper"]
+      log_debug("Processing column '%s': Lower=%.3f, Upper=%.3f", col, lower, upper)
+      idx <- which(data[[col]] < lower | data[[col]] > upper)
+      if (length(idx) > 0) {
+        log_debug("Column '%s' - indices flagged: %s", col, paste(idx, collapse = ", "))
+        log_debug("Column '%s' - values before replacement: %s", col, paste(data[[col]][idx], collapse = ", "))
+        data[[col]][idx] <- NA
+        log_debug("Column '%s' - values after replacement: %s", col, paste(data[[col]][idx], collapse = ", "))
+      } else {
+        log_debug("Column '%s' - no outliers flagged.", col)
+      }
+    }
+  }
+  log_debug("apply_outlier_removal complete.")
+  return(data)
+}
+
+### ============================================================
+### 5. Generate Interaction Terms
+### ============================================================
+generate_interaction_terms <- function(data, degree = 2) {
+  log_debug("Starting generate_interaction_terms with degree=%d", degree)
+  if (degree != 2) stop("Only pairwise (degree = 2) interactions are supported.")
+  numeric_cols <- names(data)[sapply(data, is.numeric)]
+  if (length(numeric_cols) < 2) return(data)
+  interactions <- list()
+  for (i in 1:(length(numeric_cols) - 1)) {
+    for (j in (i + 1):length(numeric_cols)) {
+      new_col_name <- paste(numeric_cols[i], numeric_cols[j], sep = "_x_")
+      interactions[[new_col_name]] <- data[[numeric_cols[i]]] * data[[numeric_cols[j]]]
+      log_debug("Created interaction column '%s'", new_col_name)
+    }
+  }
   interactions_df <- as.data.frame(interactions)
+  log_debug("generate_interaction_terms complete.")
   return(cbind(data, interactions_df))
 }
 
-
-#' Preprocess Data for Machine Learning
-#'
-#' This function preprocesses a dataset for machine learning purposes. It includes partitioning the data into training and test sets, handling date variables, applying ordinal encoding, scaling, one-hot encoding, outlier removal, imputation of missing data, generation of interaction terms, and applying custom transformations.
-#'
-#' @param data A dataframe that contains the dataset to be preprocessed.
-#' @param outcome_var A string representing the name of the outcome variable in the dataset.
-#' @param partition_ratio A numeric value representing the proportion of the dataset to be used for training. Default is 0.7.
-#' @param date_vars A vector of strings representing the names of date variables in the dataset. If NULL (default), no date handling is performed.
-#' @param outlier_multiplier A numeric value used in outlier detection. Default is 1.5.
-#' @param interaction_degree An integer indicating the degree of interaction terms to generate. Default is 2.
-#' @param custom_transform An optional custom function for data transformation. If NULL (default), no custom transformation is applied.
-#' @param feature_selection A logical indicating whether feature selection should be performed. Default is TRUE.
-#' @param num_selected_features An integer specifying the number of features to select if feature selection is enabled. Default is 3.
-#' @param ordinal_encoding A logical indicating whether to apply ordinal encoding to the outcome variable. Default is FALSE.
-#' @param scale_data_flag A logical indicating whether to scale the data. Default is TRUE.
-#' @param impute_method A string specifying the method for imputing missing data. Default is 'pmm'.
-#' 
-#' @importFrom caret createDataPartition
-#' @importFrom somePackage scale_data, one_hot_encode, remove_outliers, impute_missing_data, generate_interaction_terms
-#' 
-#' @return A list containing the preprocessed training and test datasets.
-#' 
-#' @examples
-#' \dontrun{
-#'   # Example usage of preprocess_data
-#'   processed_data <- preprocess_data(my_data, "target_variable")
-#' }
-#'
-#' @export
-preprocess_data <- function(data, outcome_var, partition_ratio = 0.7, date_vars = NULL,
-                            outlier_multiplier = 1.5, interaction_degree = 2,
-                            custom_transform = NULL, feature_selection = TRUE, num_selected_features = 3,
-                            ordinal_encoding = FALSE, scale_data_flag = TRUE, impute_method = 'pmm') {
-  
-  # Error Handling: Check if data is a dataframe
-  if (!is.data.frame(data)) {
-    stop("data must be a dataframe")
-  }
-  
-  # Error Handling: Check if outcome_var exists in data
-  if (!outcome_var %in% names(data)) {
-    stop("outcome_var not found in data")
-  }
-  
-  # Error Handling: Check if date_vars exist in data
-  if (!is.null(date_vars) && !all(date_vars %in% names(data))) {
-    stop("Some date_vars not found in data")
-  }
-  
-  # Apply ordinal encoding if necessary
-  if (ordinal_encoding) {
-    levels <- unique(data[[outcome_var]])
-    ordinal_levels <- 1:length(levels)
-    names(ordinal_levels) <- levels
-    data[[outcome_var]] <- ordinal_levels[data[[outcome_var]]]
-  }
-  
-  # Partition data
-  trainIndex <- caret::createDataPartition(data[[outcome_var]], p = partition_ratio, list = FALSE, times = 1)
-  train <- data[trainIndex, ]
-  test <- data[-trainIndex, ]
-  
-  # Handle datetime variables
-  if (!is.null(date_vars)) {
-    for (var in date_vars) {
-      train[[var]] <- as.POSIXct(train[[var]], format = "%Y-%m-%d")
-      test[[var]] <- as.POSIXct(test[[var]], format = "%Y-%m-%d")
-    }
-  }
-  
-  # Scale data
-  if (scale_data_flag) {
-    train <- scale_data(train)
-  }
-  
-  # One-hot encode
-  train <- one_hot_encode(train)
-  
-  # Remove outliers
-  train <- remove_outliers(train, multiplier = outlier_multiplier)
-  
-  # Impute missing data (after outlier removal)
-  train <- impute_missing_data(train, method = impute_method)
-  
-  # Generate Interaction Terms
-  if (interaction_degree > 1) {
-    train <- generate_interaction_terms(train, degree = interaction_degree)
-  }
-  
-  # Custom transformations
-  if (!is.null(custom_transform) && is.function(custom_transform)) {
-    train <- custom_transform(train)
-  }
-  
-  return(list(train = train, test = test))
-}
-
-
-#' Apply Transformations to Data
-#'
-#' This function applies various preprocessing transformations to a given dataframe. 
-#' It includes scaling, imputation, outlier removal, one-hot encoding, interaction terms, 
-#' and custom transformations.
-#'
-#' @param data A dataframe to which transformations are to be applied. 
-#'             This is a required parameter.
-#' @param preproc_params A list containing parameters for different transformations:
-#'        - scaler_params: A list with 'center' and 'scale' for scaling numeric columns. Optional.
-#'        - imputer_params: A list with 'method' for imputing missing data. Optional.
-#'        - one_hot_encoder_params: An object (like a model) for one-hot encoding. Optional.
-#'        - outlier_params: A list with 'multiplier' for outlier removal. Optional.
-#'        - interaction_params: A list with 'degree' for generating interaction terms. Optional.
-#'        - custom_transform: A custom function to be applied to the data. Optional.
-#' @return A dataframe with the applied transformations.
-#' @importFrom stats scale poly
-#' @importFrom base lapply is.function as.vector
-#' @import custom_package remove_outliers impute_missing_data predict
-#' @examples
-#' \dontrun{
-#'   data <- data.frame(a = 1:10, b = rnorm(10))
-#'   preproc_params <- list(
-#'     scaler_params = list(center = TRUE, scale = TRUE),
-#'     imputer_params = list(method = "median"),
-#'     custom_transform = function(x) {return(x * 2)}
-#'   )
-#'   transformed_data <- apply_transformations(data, preproc_params)
-#' }
-#' @export
+### ============================================================
+### 6. Apply Transformations to Data
+### ============================================================
 apply_transformations <- function(data, preproc_params) {
-  # Extract parameters
-  scaler_params <- preproc_params$scaler_params
-  imputer_params <- preproc_params$imputer_params
-  one_hot_encoder_params <- preproc_params$one_hot_encoder_params
-  outlier_params <- preproc_params$outlier_params
-  interaction_params <- preproc_params$interaction_params
-  custom_transform <- preproc_params$custom_transform
+  log_debug("Starting apply_transformations")
+  if (!is.data.frame(data)) stop("data must be a dataframe")
   
-  # Check if data is a dataframe
-  if (!is.data.frame(data)) {
-    stop("data must be a dataframe")
+  if (!is.null(preproc_params$scaler)) {
+    data <- apply_scaler(data, preproc_params$scaler)
   }
-  
-  # Scale data
-  if (!is.null(scaler_params)) {
-    data[sapply(data, is.numeric)] <- lapply(data[sapply(data, is.numeric)], function(x) {
-      as.vector(scale(x, center = scaler_params$center, scale = scaler_params$scale))
-    })
-  }
-  
-  # Remove outliers and then impute missing data
-  if (!is.null(outlier_params)) {
-    data <- remove_outliers(data, multiplier = outlier_params$multiplier)
-    if (!is.null(imputer_params)) {
-      data <- impute_missing_data(data, method = imputer_params$method)
+  if (!is.null(preproc_params$outlier_params)) {
+    if (!is.null(preproc_params$outlier_params$thresholds)) {
+      data <- apply_outlier_removal(data, preproc_params$outlier_params$thresholds)
+    } else {
+      thresholds <- fit_outlier_removal(data, multiplier = preproc_params$outlier_params$multiplier)
+      data <- apply_outlier_removal(data, thresholds)
     }
   }
-  
-  # Apply one-hot encoding
-  if (!is.null(one_hot_encoder_params)) {
-    data_encoded <- predict(one_hot_encoder_params, newdata = data)
-    data_encoded <- as.data.frame(data_encoded)  # Ensure data remains a dataframe
-    data <- cbind(data[!names(data) %in% names(data_encoded)], data_encoded)
+  if (!is.null(preproc_params$imputer_params)) {
+    data <- impute_missing_data(data,
+                                numeric_method = preproc_params$imputer_params$numeric_method,
+                                binary_factor_method = preproc_params$imputer_params$binary_factor_method,
+                                multiclass_factor_method = preproc_params$imputer_params$multiclass_factor_method,
+                                m = preproc_params$imputer_params$m,
+                                maxit = preproc_params$imputer_params$maxit,
+                                seed = preproc_params$imputer_params$seed,
+                                parallel = preproc_params$imputer_params$parallel,
+                                ncores = preproc_params$imputer_params$ncores)
   }
-  
-  # Interaction terms
-  if (!is.null(interaction_params)) {
-    num_vars <- sapply(data, is.numeric)
-    data[num_vars] <- lapply(data[num_vars], function(x) {
-      if (is.numeric(x)) {
-        interaction_term <- poly(x, degree = interaction_params$degree, interactions = TRUE)
-        return(as.vector(interaction_term))
-      }
-      return(x)
-    })
+  if (!is.null(preproc_params$one_hot_encoder_params)) {
+    data <- apply_one_hot_encoder(data,
+                                  preproc_params$one_hot_encoder_params$dummy_model,
+                                  preproc_params$one_hot_encoder_params$outcome_var)
   }
-  
-  # Custom transformations
-  if (!is.null(custom_transform) && is.function(custom_transform)) {
-    data <- custom_transform(data)
+  if (!is.null(preproc_params$interaction_params)) {
+    data <- generate_interaction_terms(data, degree = preproc_params$interaction_params$degree)
   }
-  
+  if (!is.null(preproc_params$custom_transform) && is.function(preproc_params$custom_transform)) {
+    data <- preproc_params$custom_transform(data)
+  }
+  log_debug("apply_transformations complete.")
   return(as.data.frame(data))
 }
 
+### ============================================================
+### 7. Comprehensive Preprocessing Pipeline with Feature Selection
+### ============================================================
+preprocess_data <- function(data,
+                            outcome_var,
+                            partition_ratio = 0.7,
+                            date_vars = NULL,
+                            outlier_multiplier = 1.5,
+                            interaction_degree = 2,
+                            custom_transform = NULL,
+                            feature_selection = TRUE,
+                            feature_selection_method = "ranger",  # Options: "ranger", "Boruta", "LASSO"
+                            num_selected_features = 3,
+                            ordinal_encoding = FALSE,
+                            scale_data_flag = TRUE,
+                            scaling_method = "standard",
+                            numeric_impute_method = "pmm",
+                            binary_factor_impute_method = "logreg",
+                            multiclass_factor_impute_method = "polyreg",
+                            m = 5,
+                            maxit = 50,
+                            seed = 500,
+                            one_hot_fullRank = FALSE,
+                            impute_parallel = FALSE,
+                            impute_ncores = detectCores() - 1) {
+  log_debug("Starting preprocess_data")
+  if (!is.data.frame(data)) stop("data must be a dataframe")
+  if (!outcome_var %in% names(data)) stop("outcome_var not found in data")
+  if (!is.null(date_vars) && !all(date_vars %in% names(data))) stop("Some date_vars not found in data")
+  
+  if (ordinal_encoding) {
+    orig_levels <- unique(data[[outcome_var]])
+    encoding <- setNames(seq_along(orig_levels), orig_levels)
+    data[[outcome_var]] <- as.numeric(encoding[as.character(data[[outcome_var]])])
+  }
+  
+  trainIndex <- caret::createDataPartition(data[[outcome_var]], p = partition_ratio, list = FALSE)
+  train <- data[trainIndex, , drop = FALSE]
+  test  <- data[-trainIndex, , drop = FALSE]
+  log_debug("Data partitioned: %d training rows, %d test rows", nrow(train), nrow(test))
+  
+  if (!is.null(date_vars)) {
+    for (var in date_vars) {
+      train[[var]] <- as.POSIXct(train[[var]], format = "%Y-%m-%d")
+      test[[var]]  <- as.POSIXct(test[[var]], format = "%Y-%m-%d")
+    }
+  }
+  
+  if (scale_data_flag) {
+    scaler <- fit_scaler(train, scaling_method = scaling_method)
+    train <- apply_scaler(train, scaler)
+    test  <- apply_scaler(test, scaler)
+  }
+  
+  dummy_model <- fit_one_hot_encoder(train, outcome_var, fullRank = one_hot_fullRank)
+  train <- apply_one_hot_encoder(train, dummy_model, outcome_var)
+  test  <- apply_one_hot_encoder(test, dummy_model, outcome_var)
+  
+  thresholds <- fit_outlier_removal(train, multiplier = outlier_multiplier)
+  train <- apply_outlier_removal(train, thresholds)
+  test  <- apply_outlier_removal(test, thresholds)
+  
+  train <- impute_missing_data(train,
+                               numeric_method = numeric_impute_method,
+                               binary_factor_method = binary_factor_impute_method,
+                               multiclass_factor_method = multiclass_factor_impute_method,
+                               m = m, maxit = maxit, seed = seed,
+                               parallel = impute_parallel, ncores = impute_ncores)
+  test <- impute_missing_data(test,
+                              numeric_method = numeric_impute_method,
+                              binary_factor_method = binary_factor_impute_method,
+                              multiclass_factor_method = multiclass_factor_impute_method,
+                              m = m, maxit = maxit, seed = seed,
+                              parallel = impute_parallel, ncores = impute_ncores)
+  
+  if (interaction_degree > 1) {
+    train <- generate_interaction_terms(train, degree = interaction_degree)
+    test  <- generate_interaction_terms(test, degree = interaction_degree)
+  }
+  
+  if (!is.null(custom_transform) && is.function(custom_transform)) {
+    train <- custom_transform(train)
+    test  <- custom_transform(test)
+  }
+  
+  # Feature Selection Step
+  if (feature_selection) {
+    if (feature_selection_method == "ranger") {
+      log_debug("Performing feature selection with ranger.")
+      predictors <- setdiff(names(train), outcome_var)
+      if (length(predictors) > 0) {
+        formula <- as.formula(paste(outcome_var, "~", paste(predictors, collapse = " + ")))
+        ranger_mode <- if (is.factor(train[[outcome_var]])) "classification" else "regression"
+        rf_model <- ranger(formula, data = train, importance = "impurity",
+                           num.trees = 100, classification = (ranger_mode == "classification"))
+        imp <- rf_model$variable.importance
+        imp <- sort(imp, decreasing = TRUE)
+        selected_predictors <- names(imp)[1:min(num_selected_features, length(imp))]
+        log_debug("Selected predictors (ranger): %s", paste(selected_predictors, collapse = ", "))
+        train <- train[, c(selected_predictors, outcome_var), drop = FALSE]
+        test  <- test[, c(selected_predictors, outcome_var), drop = FALSE]
+      }
+    } else if (feature_selection_method == "Boruta") {
+      log_debug("Performing feature selection with Boruta.")
+      form <- as.formula(paste(outcome_var, "~ ."))
+      boruta_out <- Boruta(form, data = train, doTrace = 0)
+      final_vars <- getSelectedAttributes(boruta_out, withTentative = FALSE)
+      if (length(final_vars) == 0) {
+        final_vars <- setdiff(names(train), outcome_var)
+        log_debug("Boruta did not select any variable; using all predictors.")
+      }
+      log_debug("Selected predictors (Boruta): %s", paste(final_vars, collapse = ", "))
+      train <- train[, c(final_vars, outcome_var), drop = FALSE]
+      test  <- test[, c(final_vars, outcome_var), drop = FALSE]
+    } else if (feature_selection_method == "LASSO") {
+      log_debug("Performing feature selection with LASSO (glmnet).")
+      predictors <- setdiff(names(train), outcome_var)
+      x <- model.matrix(as.formula(paste("~", paste(predictors, collapse = " + "))), data = train)[, -1]
+      y <- train[[outcome_var]]
+      if (is.factor(y)) {
+        if (length(levels(y)) > 2) {
+          family <- "multinomial"
+        } else {
+          family <- "binomial"
+        }
+      } else {
+        family <- "gaussian"
+      }
+      cvfit <- cv.glmnet(x, y, family = family, alpha = 1, standardize = FALSE)
+      if (family == "multinomial") {
+        coefs <- coef(cvfit, s = "lambda.min")
+        # coefs is a list; take the union of variables with nonzero coefficients across classes
+        selected_predictors <- unique(unlist(lapply(coefs, function(mat) {
+          rownames(mat)[which(as.numeric(mat) != 0)]
+        })))
+        selected_predictors <- setdiff(selected_predictors, "(Intercept)")
+      } else {
+        coefs <- coef(cvfit, s = "lambda.min")
+        selected_predictors <- rownames(coefs)[which(as.numeric(coefs) != 0)]
+        selected_predictors <- setdiff(selected_predictors, "(Intercept)")
+      }
+      if (length(selected_predictors) == 0) {
+        selected_predictors <- predictors
+        log_debug("LASSO did not select any variables; using all predictors.")
+      }
+      log_debug("Selected predictors (LASSO): %s", paste(selected_predictors, collapse = ", "))
+      train <- train[, c(selected_predictors, outcome_var), drop = FALSE]
+      test  <- test[, c(selected_predictors, outcome_var), drop = FALSE]
+    } else {
+      stop("Unknown feature_selection_method. Choose from 'ranger', 'Boruta', or 'LASSO'.")
+    }
+  }
+  
+  log_debug("preprocess_data complete.")
+  return(list(train = train, test = test))
+}
 
-#' @examples
-#' \dontrun{
-#'   # Generating a Sample Dataset
-#'   set.seed(0)
-#'   A <- runif(100) * 10
-#'   B <- sample(1:10, 100, replace = TRUE)
-#'   C <- sample(c('Cat1', 'Cat2', 'Cat3', 'Cat4', 'Cat5'), 100, replace = TRUE)
-#'   D <- seq(as.Date("2023-01-01"), by="day", length.out=100)
-#'   E <- rnorm(100) * 50
-#'   F <- sample(c(NA, 1:10), 100, replace = TRUE)
-#'   Outcome <- sample(0:1, 100, replace = TRUE)
-#' 
-#'   df <- data.frame(A, B, C, D, E, F, Outcome)
-#'   df$E[1:6] <- df$E[1:6] * 4
-#'   df$A[7:11] <- NA
-#' 
-#'   # Checking for constant columns
-#'   constant_columns <- sapply(df, function(x) length(unique(x)) == 1)
-#'   if (any(constant_columns)) {
-#'     warning("The dataset contains constant columns.")
-#'   }
-#' 
-#'   # Applying Preprocessing (Assuming 'preprocess_data' function exists)
-#'   processed_data <- preprocess_data(df, outcome_var = "Outcome", date_vars = c("D"))
-#' 
-#'   # Explore the processed data
-#'   head(processed_data$train)
-#'   head(processed_data$test)
-#' 
-#'   # Create a list of preprocessing parameters
-#'   preproc_params <- list(
-#'     scaler_params = list(center = TRUE, scale = TRUE),
-#'     imputer_params = list(method = 'pmm'),
-#'     one_hot_encoder_params = caret::dummyVars("~.", data = df),
-#'     outlier_params = list(multiplier = 1.5),
-#'     interaction_params = list(degree = 2),
-#'     custom_transform = NULL
-#'   )
-#' 
-#'   # Apply the transformations to a new dataset (or the test set)
-#'   transformed_data <- apply_transformations(df, preproc_params)
-#' 
-#'   # View the transformed data
-#'   head(transformed_data)
-#' }
+### ============================================================
+### 8. Hyperparameter Tuning for Preprocessing
+### ============================================================
+tune_preprocessing_params <- function(data, outcome_var,
+                                      grid = list(outlier_multiplier = c(1.5, 2.0, 2.5),
+                                                  scaling_method = c("standard", "minmax"),
+                                                  imputation_method = c("pmm")),
+                                      feature_selection_method = "ranger",
+                                      cv_folds = 3,
+                                      metric = NULL,
+                                      seed = 123) {
+  set.seed(seed)
+  log_debug("Starting hyperparameter tuning over grid: %s",
+            paste(sapply(grid, paste, collapse = ","), collapse = "; "))
+  
+  outcome_is_factor <- is.factor(data[[outcome_var]])
+  if (is.null(metric)) {
+    metric <- if (outcome_is_factor) "Accuracy" else "RMSE"
+  }
+  
+  best_score <- if (outcome_is_factor) -Inf else Inf
+  best_params <- list()
+  
+  train_control <- trainControl(method = "cv", number = cv_folds)
+  
+  for (om in grid$outlier_multiplier) {
+    for (sm in grid$scaling_method) {
+      for (im in grid$imputation_method) {
+        log_debug("Testing: outlier_multiplier=%.2f, scaling_method=%s, imputation_method=%s", om, sm, im)
+        preproc_params <- list(
+          scaler = fit_scaler(data, scaling_method = sm),
+          outlier_params = list(multiplier = om),
+          imputer_params = list(numeric_method = im,
+                                binary_factor_method = "logreg",
+                                multiclass_factor_method = "polyreg",
+                                m = 5, maxit = 50, seed = seed, parallel = FALSE),
+          one_hot_encoder_params = list(dummy_model = fit_one_hot_encoder(data, outcome_var, fullRank = TRUE),
+                                        outcome_var = outcome_var),
+          interaction_params = list(degree = 2),
+          custom_transform = function(x) { x }
+        )
+        data_pp <- impute_missing_data(data, parallel = FALSE)
+        splits <- createDataPartition(data_pp[[outcome_var]], p = 0.7, list = FALSE)
+        train_data <- data_pp[splits, ]
+        train_pp <- apply_transformations(train_data, preproc_params)
+        form <- as.formula(paste(outcome_var, "~ ."))
+        model <- try(ranger(form, data = train_pp, num.trees = 50, classification = outcome_is_factor), silent = TRUE)
+        if (inherits(model, "try-error")) next
+        cv_model <- train(form, data = train_pp, method = "ranger",
+                          trControl = train_control,
+                          tuneLength = 1,
+                          metric = metric,
+                          num.trees = 50)
+        score <- cv_model$results[[metric]]
+        log_debug("Score: %s", score)
+        if ((outcome_is_factor && score > best_score) ||
+            (!outcome_is_factor && score < best_score)) {
+          best_score <- score
+          best_params <- list(outlier_multiplier = om, scaling_method = sm, imputation_method = im)
+          log_debug("New best: %s", paste(names(best_params), best_params, sep = "=", collapse = ", "))
+        }
+      }
+    }
+  }
+  log_debug("Tuning complete. Best score: %s, Parameters: %s", best_score,
+            paste(names(best_params), best_params, sep = "=", collapse = ", "))
+  return(list(best_params = best_params, best_score = best_score))
+}
+
+### ============================================================
+### 9. User Acceptance Testing (UAT) with Improved Synthetic Data
+### ============================================================
+run_uat <- function() {
+  message("Running User Acceptance Tests ...")
+  
+  # Create synthetic data with increased variability
+  set.seed(123)
+  n <- 100
+  df <- data.frame(
+    num1 = c(rnorm(n - 1, mean = 50, sd = 10), 120),  # Deliberate outlier at end
+    num2 = rnorm(n, mean = 30, sd = 5),
+    fac1 = factor(sample(c("A", "B", "C"), n, replace = TRUE)),
+    fac2 = factor(sample(c("X", "Y"), n, replace = TRUE))
+  )
+  # Introduce random missing values
+  df$num1[sample(1:n, 5)] <- NA
+  df$num2[sample(1:n, 3)] <- NA
+  df$fac1[sample(1:n, 2)] <- NA
+  df$fac2[sample(1:n, 2)] <- NA
+  
+  # Imputation test
+  df_imputed <- impute_missing_data(df, parallel = TRUE, ncores = 2)
+  stopifnot(all(!is.na(df_imputed)))
+  message("impute_missing_data: PASS")
+  
+  # Scaling tests
+  scaler_std <- fit_scaler(df_imputed, scaling_method = "standard")
+  df_scaled_std <- apply_scaler(df_imputed, scaler_std)
+  stopifnot(is.numeric(df_scaled_std$num1), is.numeric(df_scaled_std$num2))
+  
+  scaler_mm <- fit_scaler(df_imputed, scaling_method = "minmax")
+  df_scaled_mm <- apply_scaler(df_imputed, scaler_mm)
+  tol <- 1e-8
+  if (!all(df_scaled_mm$num1 >= -tol & df_scaled_mm$num1 <= 1 + tol, na.rm = TRUE))
+    stop("Scaling (minmax) for num1 out of bounds.")
+  message("Scaling functions: PASS")
+  
+  # One-hot encoding test
+  dummy_model <- fit_one_hot_encoder(df_imputed, outcome_var = "fac1", fullRank = TRUE)
+  df_ohe <- apply_one_hot_encoder(df_imputed, dummy_model, outcome_var = "fac1")
+  stopifnot("fac1" %in% names(df_ohe))
+  message("One-hot encoding functions: PASS")
+  
+  # Outlier removal test
+  log_debug("Original 'num1' values: %s", paste(df$num1, collapse = ", "))
+  thresholds_orig <- fit_outlier_removal(df, multiplier = 1.5)
+  df_no_outliers_orig <- apply_outlier_removal(df, thresholds_orig)
+  if (!is.na(df_no_outliers_orig$num1[nrow(df_no_outliers_orig)]))
+    stop("Expected the last value of num1 to be NA after outlier removal.")
+  message("Outlier removal functions: PASS")
+  
+  # Interaction terms test
+  df_interact <- generate_interaction_terms(df_imputed, degree = 2)
+  stopifnot("num1_x_num2" %in% names(df_interact))
+  message("generate_interaction_terms: PASS")
+  
+  # Test apply_transformations
+  preproc_params <- list(
+    scaler = scaler_std,
+    outlier_params = list(multiplier = 1.5),
+    imputer_params = list(numeric_method = "pmm", binary_factor_method = "logreg",
+                          multiclass_factor_method = "polyreg", m = 5, maxit = 50, seed = 500, parallel = TRUE, ncores = 2),
+    one_hot_encoder_params = list(dummy_model = dummy_model, outcome_var = "fac1"),
+    interaction_params = list(degree = 2),
+    custom_transform = function(x) { x }
+  )
+  df_transformed <- apply_transformations(df_imputed, preproc_params)
+  stopifnot(is.data.frame(df_transformed))
+  message("apply_transformations: PASS")
+  
+  # Test preprocess_data with each feature selection method
+  for (fs_method in c("ranger", "Boruta", "LASSO")) {
+    log_debug("Testing preprocess_data with feature_selection_method=%s", fs_method)
+    preprocessed <- preprocess_data(df,
+                                    outcome_var = "fac1",
+                                    partition_ratio = 0.7,
+                                    outlier_multiplier = 1.5,
+                                    interaction_degree = 2,
+                                    feature_selection = TRUE,
+                                    feature_selection_method = fs_method,
+                                    num_selected_features = 3,
+                                    scaling_method = "standard",
+                                    numeric_impute_method = "pmm",
+                                    binary_factor_impute_method = "logreg",
+                                    multiclass_factor_impute_method = "polyreg",
+                                    m = 5,
+                                    maxit = 50,
+                                    seed = 500,
+                                    one_hot_fullRank = FALSE,
+                                    impute_parallel = TRUE, impute_ncores = 2)
+    stopifnot(is.list(preprocessed),
+              "train" %in% names(preprocessed),
+              "test" %in% names(preprocessed))
+    message(sprintf("preprocess_data (%s): PASS", fs_method))
+  }
+  
+  # Test hyperparameter tuning
+  tuning_results <- tune_preprocessing_params(df, outcome_var = "fac1",
+                                              grid = list(outlier_multiplier = c(1.5, 2.0),
+                                                          scaling_method = c("standard", "minmax"),
+                                                          imputation_method = c("pmm")))
+  message(sprintf("Hyperparameter tuning: Best parameters: %s with score: %s", 
+                  paste(names(tuning_results$best_params), tuning_results$best_params, sep = "=", collapse = ", "),
+                  tuning_results$best_score))
+  
+  message("All tests passed!")
+}
+
+# Run UAT if in interactive mode
+if (interactive()) {
+  run_uat()
+}
