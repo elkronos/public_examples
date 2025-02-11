@@ -1,436 +1,511 @@
-#' ######################## Index and Table of Contents
-#' 
-#' # LINE 030 - create_graph() - Prepare data (dataframe to network graph)
-#' # LINE 083 - group_summary() - Calculate descriptive network information.
-#' # LINE 119 - plot_graph() - Plot a network graph
-#' # LINE 163 - plot_degree_distribution() - Plot the degree distribution of nodes (asses peaks and distribution)
-#' # LINE 201 - compare_graphs() - Compare differences among two networks
-#' # LINE 260 - network_overlap() - Calculate overlap between two networks
-#' # LINE 302 - network_metrics() - Calculate measures of centrality as well as other KPIs (cluster, small worldness, etc)
-#' # LINE 355 - save_graph() - Save network plots
-#' 
-# Load libraries
+# -------------------------------
+# Required Libraries
+# -------------------------------
 library(igraph)
 library(dplyr)
+library(ggplot2)
 library(ggraph)
 library(tidygraph)
+library(scales)     # For trans_breaks
+library(viridis)    # For viridis color scales
+library(testthat)   # For UAT tests
 
-#' Prepare graph input and create graph
-#' 
-#' This function takes a data frame and converts it into a graph object using the igraph package. The first two columns of the data frame are assumed to represent edges of the graph, and additional columns can be used to specify attributes of each edge. The function removes duplicate rows and rows with missing values before creating the graph. The resulting graph object can be directed or undirected.
-#' 
-#' @param df A data frame with at least two columns representing the edges of the graph.
-#' @param directed Logical. If TRUE, the resulting graph will be directed. If FALSE, the graph will be undirected. Default is FALSE.
-#' @param weight_col The name of a column in the data frame that specifies the weight of each edge. If NULL (default), all edges are assumed to have equal weight.
-#' 
-#' @return A graph object created from the input data frame using the igraph package. The graph will have an additional vertex attribute called "group", which specifies the connected component to which each vertex belongs.
-#' 
-#' @importFrom igraph graph_from_data_frame set_vertex_attr components membership E
-#' @import dplyr
+# -------------------------------
+# Helper Function: Compute Subgraph Centrality
+# -------------------------------
+# Computes the subgraph centrality for each vertex using the spectral formula:
+# SC(v) = sum_j [ (v_j(v))^2 * exp(lambda_j) ]
+compute_subgraph_centrality <- function(graph) {
+  if (vcount(graph) == 0) {
+    stop("Graph has no vertices.")
+  }
+  # Work on an undirected version for subgraph centrality.
+  ug <- if (is_directed(graph)) as.undirected(graph, mode = "collapse") else graph
+  A <- as.matrix(as_adjacency_matrix(ug))
+  ev <- eigen(A)
+  # Compute subgraph centrality: sum((eigenvector^2) * exp(eigenvalue))
+  sc <- rowSums((ev$vectors^2) * rep(exp(ev$values), each = nrow(ev$vectors)))
+  names(sc) <- V(ug)$name
+  return(sc)
+}
+
+# -------------------------------
+# 1. create_graph: Prepare Data (Data Frame to Network Graph)
+# -------------------------------
+#' Create a Graph from a Data Frame
+#'
+#' @param df A data frame with at least two columns representing the edges.
+#' @param from_col The name of the column representing the source nodes.
+#' @param to_col The name of the column representing the target nodes.
+#' @param directed Logical. If TRUE, the graph is directed. Default is FALSE.
+#' @param weight_col Optional. Name of the column representing edge weights.
+#'
+#' @return An igraph graph object with a vertex attribute "group" (connected components).
 create_graph <- function(df, from_col, to_col, directed = FALSE, weight_col = NULL) {
+  if (!is.data.frame(df)) {
+    stop("Input 'df' must be a data frame.")
+  }
+  if (!(from_col %in% colnames(df)) || !(to_col %in% colnames(df))) {
+    stop("Both 'from_col' and 'to_col' must be present in the data frame.")
+  }
   if (ncol(df) < 2) {
     stop("Data frame must have at least two columns.")
   }
   
-  if (!(from_col %in% colnames(df)) || !(to_col %in% colnames(df))) {
-    stop("Both 'from_col' and 'to_col' must be present in the data frame.")
+  # Remove duplicates and rows with missing values
+  df <- df %>% distinct() %>% na.omit()
+  
+  # Build edges data frame
+  edges <- df %>%
+    select(!!from_col, !!to_col) %>%
+    rename(from = !!from_col, to = !!to_col)
+  
+  # Include any additional columns as edge attributes
+  extra_cols <- setdiff(names(df), c(from_col, to_col))
+  if (length(extra_cols) > 0) {
+    edges <- bind_cols(edges, df[extra_cols])
   }
   
-  # Remove duplicate rows and rows with missing values
-  df <- unique(df) %>% na.omit()
+  g <- graph_from_data_frame(edges, directed = directed)
   
-  # Create edges data frame from the input data frame
-  edges <- data.frame(from = df[[from_col]], to = df[[to_col]])
-  
-  # Assign the additional columns as edge attributes
-  other_cols <- setdiff(colnames(df), c(from_col, to_col))
-  for (i in seq_along(other_cols)) {
-    edges[[other_cols[i]]] <- df[[other_cols[i]]]
+  # Set weights if specified and available
+  if (!is.null(weight_col)) {
+    if (!(weight_col %in% names(df))) {
+      stop("Specified 'weight_col' not found in the data frame.")
+    }
+    E(g)$weight <- df[[weight_col]]
   }
   
-  graph <- graph_from_data_frame(edges, directed = directed)
+  # Compute connected components and assign membership as vertex attribute "group"
+  comps <- components(g)
+  g <- set_vertex_attr(g, "group", value = comps$membership)
   
-  if (!is.null(weight_col) && weight_col %in% colnames(df)) {
-    E(graph)$weight <- df[[weight_col]]
-  }
-  
-  components <- components(graph)
-  membership <- membership(components)
-  
-  graph <- set_vertex_attr(graph, "group", value = membership)
-  return(graph)
+  return(g)
 }
 
-#' Generate a summary of groups in a graph
+# -------------------------------
+# 2. group_summary: Descriptive Group Information
+# -------------------------------
+#' Generate a Summary of Graph Groups
 #'
-#' This function generates a summary of the groups in a graph, including the number
-#' of groups, the size of each group, and the list of group members.
+#' @param graph An igraph graph object.
+#' @param verbose Logical. If TRUE, prints summary to the console.
 #'
-#' @param graph A graph object from the igraph package.
-#'
-#' @return A list with the following components:
-#' \item{num_groups}{The number of groups in the graph.}
-#' \item{group_sizes}{A numeric vector containing the size of each group.}
-#' \item{group_list}{A list of character vectors, where each element is the 
-#'                    names of the vertices in the corresponding group.}
-#'
-#' @import igraph::is.null
-#' @import igraph::vcount
-#' @import igraph::ecount
-#' @importFrom igraph V
-#' @importFrom igraph split
-#' @importFrom stats sapply
-group_summary <- function(graph) {
-  if (is.null(graph) || vcount(graph) == 0 || ecount(graph) == 0) {
-    cat("Cannot generate group summary for a NULL or empty graph.\n")
-    return(NULL)
+#' @return A list with:
+#'   - num_groups: number of groups,
+#'   - group_sizes: sizes of each group,
+#'   - group_list: list of vertex names per group.
+group_summary <- function(graph, verbose = TRUE) {
+  if (!inherits(graph, "igraph") || vcount(graph) < 1) {
+    stop("Invalid or empty graph provided.")
   }
   
-  group_list <- split(V(graph)$name, V(graph)$group)
-  group_sizes <- sapply(group_list, length)
-  num_groups <- length(group_list)
-  
-  cat("Number of groups:", num_groups, "\n")
-  cat("Group sizes:", group_sizes, "\n")
-  cat("Group members:\n")
-  
-  for (i in 1:length(group_list)) {
-    cat("Group", i, ":", group_list[[i]], "\n")
+  if (is.null(V(graph)$group)) {
+    warning("Graph vertices have no 'group' attribute. Using components() to compute groups.")
+    comps <- components(graph)
+    graph <- set_vertex_attr(graph, "group", value = comps$membership)
   }
   
-  return(list(num_groups = num_groups, group_sizes = group_sizes, group_list = group_list))
+  groups <- split(V(graph)$name, V(graph)$group)
+  sizes <- sapply(groups, length)
+  num <- length(groups)
+  
+  if (verbose) {
+    cat("Number of groups:", num, "\n")
+    cat("Group sizes:", sizes, "\n")
+    cat("Group members:\n")
+    for (i in seq_along(groups)) {
+      cat("  Group", names(groups)[i], ":", paste(groups[[i]], collapse = ", "), "\n")
+    }
+  }
+  
+  return(list(num_groups = num, group_sizes = sizes, group_list = groups))
 }
 
-
-#' Plot a network graph using ggplot2 and ggraph
+# -------------------------------
+# 3. plot_graph: Plot a Network Graph
+# -------------------------------
+#' Plot a Network Graph using ggraph
 #'
-#' This function takes a graph object and plots it as a network graph using ggplot2 and ggraph. It creates a force-directed layout using the Fruchterman-Reingold algorithm and plots the nodes as points with the node names as labels. The size and color of the nodes are determined by their degree and group, respectively.
+#' @param graph An igraph graph object.
+#' @param title Title of the plot.
+#' @param layout Layout algorithm (default "fr" for Fruchterman-Reingold).
+#' @param node_extra Optional additional aesthetics for nodes (a named list).
+#' @param edge_extra Optional additional aesthetics for edges (a named list).
 #'
-#' @param graph A graph object to plot.
-#' @param title A character string for the plot title. Default is "Network Graph".
-#' @param node_aes A character string of node aesthetics to add to the plot using aes_string(). 
-#'   For example, "fill = 'blue', shape = 21, stroke = 'black'". Default is NULL.
-#' @param edge_aes A character string of edge aesthetics to add to the plot using aes_string(). 
-#'   For example, "color = 'gray80', alpha = 0.5, arrow = arrow(length = unit(0.1, 'inches'))". Default is NULL.
-#'
-#' @return A ggplot2 object representing the plotted network graph.
-#'
-#' @import tidygraph ggplot2 ggraph
-plot_graph <- function(graph, title = "Network Graph", node_aes = NULL, edge_aes = NULL) {
-  if (is.null(graph) || vcount(graph) == 0 || ecount(graph) == 0) {
-    cat("Cannot plot a NULL or empty graph.\n")
-    return(NULL)
+#' @return A ggplot object.
+plot_graph <- function(graph, title = "Network Graph", layout = "fr",
+                       node_extra = NULL, edge_extra = NULL) {
+  if (!inherits(graph, "igraph") || vcount(graph) < 1) {
+    stop("Invalid or empty graph provided.")
   }
   
+  # Convert to a tidygraph object for plotting
   tg <- as_tbl_graph(graph)
   
-  gg <- ggraph(tg, layout = "fr") +
-    geom_edge_link(aes(edge_alpha = after_stat(index)), show.legend = FALSE) +
-    geom_node_point(aes(size = degree(graph), color = as.factor(group)), show.legend = FALSE) +
+  # Base plot; the tidygraph object provides edge and node data already.
+  p <- ggraph(tg, layout = layout) +
+    geom_edge_link(aes(edge_alpha = after_stat(index)),
+                   show.legend = TRUE) +
+    geom_node_point(aes(size = centrality_degree(), color = as.factor(group)),
+                    show.legend = TRUE) +
     geom_node_text(aes(label = name), repel = TRUE, size = 3) +
     scale_color_viridis_d() +
     theme_void() +
-    labs(title = title)
+    labs(title = title, color = "Group", size = "Degree")
   
-  if (!is.null(node_aes)) {
-    gg <- gg + geom_node_point(aes_string(node_aes), show.legend = FALSE)
+  # Add additional aesthetics if provided
+  if (!is.null(node_extra) && is.list(node_extra)) {
+    p <- p + geom_node_point(mapping = do.call(aes, node_extra), show.legend = FALSE)
   }
-  if (!is.null(edge_aes)) {
-    gg <- gg + geom_edge_link(aes_string(edge_aes), show.legend = FALSE)
+  if (!is.null(edge_extra) && is.list(edge_extra)) {
+    p <- p + geom_edge_link(mapping = do.call(aes, edge_extra), show.legend = FALSE)
   }
   
-  return(gg)
+  return(p)
 }
 
-
-#' Plot the degree distribution of a graph
+# -------------------------------
+# 4. plot_degree_distribution: Plot Degree Distribution
+# -------------------------------
+#' Plot the Degree Distribution of a Graph
 #'
-#' This function takes a graph object and plots its degree distribution, i.e., the distribution of node degrees in the graph. By default, the x and y axes are transformed logarithmically, but this can be changed using the \code{x_trans} and \code{y_trans} parameters.
+#' @param graph An igraph graph object.
+#' @param title Title for the plot.
+#' @param x_trans Transformation for the x-axis (e.g., "log10").
+#' @param y_trans Transformation for the y-axis (e.g., "log10").
+#' @param ccdf Logical. If TRUE, plot the complementary cumulative distribution.
 #'
-#' @param graph A graph object to plot.
-#' @param title A character string for the plot title. Default is "Degree Distribution".
-#' @param x_trans A character string specifying the transformation to use for the x axis. Default is "log10".
-#' @param y_trans A character string specifying the transformation to use for the y axis. Default is "log10".
-#' @param ccdf A logical value indicating whether to plot the complementary cumulative distribution function (CCDF) of the degree distribution instead of the raw distribution. Default is FALSE.
-#'
-#' @return A ggplot2 object representing the plotted degree distribution.
-#'
-#' @import ggplot2 scales igraph
-#' 
-#' @seealso \code{\link{degree}}, \code{\link{group_summary}}, \code{\link{modularity}}, \code{\link{mean_distance}}
-#' 
-#' @references Clauset, A., Shalizi, C.R., Newman, M.E.J. (2009). Power-law
-plot_degree_distribution <- function(graph, title = "Degree Distribution", x_trans = "log10", y_trans = "log10", ccdf = FALSE) {
-  if (is.null(graph) || vcount(graph) == 0 || ecount(graph) == 0) {
-    cat("Cannot plot a NULL or empty graph.\n")
-    return(NULL)
+#' @return A ggplot object.
+plot_degree_distribution <- function(graph, title = "Degree Distribution",
+                                     x_trans = "log10", y_trans = "log10", ccdf = FALSE) {
+  if (!inherits(graph, "igraph") || vcount(graph) < 1) {
+    stop("Invalid or empty graph provided.")
   }
   
-  degree_values <- degree(graph)
-  degree_freq <- as.data.frame(table(degree_values))
-  colnames(degree_freq) <- c("degree", "frequency")
-  degree_freq$degree <- as.numeric(as.character(degree_freq$degree))
+  d_vals <- degree(graph)
+  df_deg <- as.data.frame(table(d_vals))
+  names(df_deg) <- c("degree", "frequency")
+  df_deg$degree <- as.numeric(as.character(df_deg$degree))
   
   if (ccdf) {
-    degree_freq$frequency <- cumsum(degree_freq$frequency, fromLast = TRUE)
+    df_deg <- df_deg[order(df_deg$degree), ]
+    df_deg$frequency <- rev(cumsum(rev(df_deg$frequency)))
   }
   
-  ggplot(degree_freq, aes(x = degree, y = frequency)) +
+  p <- ggplot(df_deg, aes(x = degree, y = frequency)) +
     geom_point() +
     geom_line(group = 1) +
-    scale_x_continuous(trans = x_trans, breaks = scales::trans_breaks(x_trans, function(x) 10^x)) +
-    scale_y_continuous(trans = y_trans, breaks = scales::trans_breaks(y_trans, function(x) 10^x)) +
+    scale_x_continuous(trans = x_trans, breaks = trans_breaks(x_trans, function(x) 10^x)) +
+    scale_y_continuous(trans = y_trans, breaks = trans_breaks(y_trans, function(x) 10^x)) +
     labs(title = title, x = "Degree", y = "Frequency") +
     theme_minimal()
+  
+  return(p)
 }
 
-
+# -------------------------------
+# 5. compare_graphs: Compare Multiple Graphs
+# -------------------------------
 #' Compare Multiple Graphs
 #'
-#' This function compares multiple graphs by computing their group summary, modularity score,
-#' and average path length. It also calculates the overlap between groups in all graphs.
+#' @param ... A variable number of igraph graph objects.
 #'
-#' @param ... A variable number of igraph objects to be compared.
-#' 
-#' @return A list containing the following items:
-#' \item{summaries}{A list of group summaries for each input graph.}
-#' \item{modularities}{A numeric vector of modularity scores for each input graph.}
-#' \item{avg_path_lengths}{A numeric vector of average path lengths for each input graph.}
-#'
-#' @importFrom igraph group_summary modularity mean_distance V
+#' @return A list containing:
+#'   - summaries: List of group summaries,
+#'   - modularities: Modularities computed using the vertex "group" attribute,
+#'   - avg_path_lengths: Average path lengths,
+#'   - group_overlaps: A list of overlaps (intersection of vertex names) for each group index.
 compare_graphs <- function(...) {
   graphs <- list(...)
-  
-  if (any(sapply(graphs, is.null))) {
-    cat("Cannot compare graphs if one or more of them are NULL.\n")
-    return(NULL)
+  n_graphs <- length(graphs)
+  if (n_graphs < 1) {
+    stop("At least one graph must be provided.")
+  }
+  if (any(sapply(graphs, function(g) !inherits(g, "igraph") || vcount(g) < 1))) {
+    stop("One or more provided graphs are invalid or empty.")
   }
   
-  n_graphs <- length(graphs)
-  summaries <- vector("list", length = n_graphs)
+  summaries <- vector("list", n_graphs)
   modularities <- numeric(n_graphs)
   avg_path_lengths <- numeric(n_graphs)
   
-  for (i in 1:n_graphs) {
-    cat("\nGraph", i, ":\n")
-    summaries[[i]] <- group_summary(graphs[[i]])
-    modularities[i] <- modularity(graphs[[i]], V(graphs[[i]])$group)
-    avg_path_lengths[i] <- mean_distance(graphs[[i]], directed = FALSE)
+  for (i in seq_along(graphs)) {
+    cat("\n--- Graph", i, "---\n")
+    summaries[[i]] <- group_summary(graphs[[i]], verbose = TRUE)
+    modularities[i] <- modularity(graphs[[i]], membership = V(graphs[[i]])$group)
+    avg_path_lengths[i] <- mean_distance(graphs[[i]], directed = is_directed(graphs[[i]]))
+    cat("Modularity:", modularities[i], "\n")
+    cat("Average path length:", avg_path_lengths[i], "\n")
   }
   
-  cat("\nModularity scores:\n")
-  for (i in 1:n_graphs) {
-    cat("Graph", i, "modularity:", modularities[i], "\n")
-  }
-  
-  cat("\nAverage path length:\n")
-  for (i in 1:n_graphs) {
-    cat("Graph", i, "average path length:", avg_path_lengths[i], "\n")
-  }
-  
-  cat("\nGroup overlaps:\n")
   max_groups <- max(sapply(summaries, function(x) length(x$group_list)))
-  
-  for (i in 1:max_groups) {
-    cat("Overlap between group", i, "in all graphs:\n")
-    overlaps <- Reduce(intersect, lapply(summaries, function(x) x$group_list[[i]]))
-    cat(overlaps, "\n")
+  group_overlaps <- list()
+  cat("\n--- Group Overlaps ---\n")
+  for (i in seq_len(max_groups)) {
+    group_members <- lapply(summaries, function(x) {
+      if (length(x$group_list) >= i) x$group_list[[i]] else character(0)
+    })
+    overlap <- Reduce(intersect, group_members)
+    group_overlaps[[paste0("group_", i)]] <- overlap
+    cat("Overlap for group", i, ":", paste(overlap, collapse = ", "), "\n")
   }
+  
+  return(list(summaries = summaries,
+              modularities = modularities,
+              avg_path_lengths = avg_path_lengths,
+              group_overlaps = group_overlaps))
 }
 
-
-#' Compute overlap between two graphs
+# -------------------------------
+# 6. network_overlap: Calculate Overlap Between Two Graphs
+# -------------------------------
+#' Compute Overlap Between Two Graphs
 #'
-#' This function computes the overlap between two graphs and returns a list with information about the overlap.
+#' @param graph1 An igraph graph object.
+#' @param graph2 An igraph graph object.
 #'
-#' @param graph1 A graph object.
-#' @param graph2 A graph object.
-#'
-#' @return A list with the following elements:
-#' \itemize{
-#'     \item \code{common_nodes}: A character vector of node names that are present in both graphs.
-#'     \item \code{common_edges}: A graph object representing the edges that are present in both graphs.
-#'     \item \code{num_common_nodes}: The number of nodes that are present in both graphs.
-#'     \item \code{num_common_edges}: The number of edges that are present in both graphs.
-#' }
-#'
-#' @details
-#' The function first checks if either of the input graphs are null or empty. If either graph is null or has no nodes or edges, the function returns a message and NULL. The function then computes the overlap between the two graphs and returns a list with information about the overlap. The overlap is defined as the set of nodes and edges that are present in both graphs.
-#'
+#' @return A list with:
+#'   - common_nodes: Names of nodes present in both graphs.
+#'   - common_edges: The graph representing the intersection of edges.
+#'   - num_common_nodes: Count of common nodes.
+#'   - num_common_edges: Count of common edges.
 network_overlap <- function(graph1, graph2) {
-  if (is.null(graph1) || is.null(graph2) || vcount(graph1) == 0 || ecount(graph1) == 0 || vcount(graph2) == 0 || ecount(graph2) == 0) {
-    cat("Cannot compute overlap for NULL or empty graphs.\n")
-    return(NULL)
+  if (!inherits(graph1, "igraph") || !inherits(graph2, "igraph") ||
+      vcount(graph1) < 1 || vcount(graph2) < 1) {
+    stop("Both graphs must be valid and non-empty.")
   }
   
   common_nodes <- intersect(V(graph1)$name, V(graph2)$name)
   common_edges <- intersection(graph1, graph2, byname = TRUE)
   
-  overlap <- list(
+  result <- list(
     common_nodes = common_nodes,
     common_edges = common_edges,
     num_common_nodes = length(common_nodes),
     num_common_edges = ecount(common_edges)
   )
-  
-  return(overlap)
+  return(result)
 }
 
-
-#' Calculate centrality measures and other metrics
+# -------------------------------
+# 7. network_metrics: Calculate Centrality Measures and Other KPIs
+# -------------------------------
+#' Calculate Network Metrics
 #'
-#' This function calculates various centrality measures and other metrics for a given graph. The function takes a graph object, as created by the \code{\link[igraph]{graph_from_edgelist}} or \code{\link[igraph]{graph_from_data_frame}} functions from the \code{igraph} package. The function computes the following measures:
-#' 
-#' \itemize{
-#'   \item Degree centrality: the number of edges that a node has divided by the total number of possible edges.
-#'   \item Closeness centrality: the inverse of the sum of the shortest path lengths between a node and all other nodes in the graph.
-#'   \item Betweenness centrality: the number of shortest paths that pass through a node, divided by the total number of shortest paths.
-#'   \item Eigenvector centrality: a measure of the importance of a node based on the importance of its neighbors.
-#'   \item Subgraph centrality: a measure of the centrality of a node based on the centrality of its subgraphs.
-#'   \item Clustering coefficient: the fraction of pairs of a node's neighbors that are connected by an edge.
-#'   \item Small worldness: a measure of the degree to which a graph is more efficient at information transfer than a random graph with the same degree distribution.
-#'   \item Coreness: a measure of the connectivity of a node to highly connected nodes in the graph.
-#' }
-#' 
-#' @param graph A graph object, as created by the \code{\link[igraph]{graph_from_edgelist}} or \code{\link[igraph]{graph_from_data_frame}} functions from the \code{igraph} package.
-#' @param normalize A logical value indicating whether the betweenness centrality and eigenvector centrality measures should be normalized.
-#' @param label_col The name of the column in the data frame from which to obtain labels for the nodes in the graph. If this parameter is provided, the node labels will be added to the output data frame.
+#' Computes various centrality measures and network metrics including:
+#'   - Degree, closeness, betweenness, eigenvector, and subgraph centrality.
+#'   - Clustering coefficient.
+#'   - Small worldness (sigma = (C/Crand) / (L/Lrand)).
+#'   - Coreness.
 #'
-#' @return A data frame containing the calculated centrality measures and other metrics.
+#' @param graph An igraph graph object.
+#' @param normalize Logical. If TRUE, betweenness and eigenvector centralities are normalized.
 #'
-#' @import igraph
-network_metrics <- function(graph, normalize = TRUE, label_col = NULL) {
-  if (is.null(graph) || vcount(graph) == 0 || ecount(graph) == 0) {
-    cat("Cannot compute metrics for a NULL or empty graph.\n")
-    return(NULL)
+#' @return A data frame with metrics for each vertex.
+network_metrics <- function(graph, normalize = TRUE) {
+  if (!inherits(graph, "igraph") || vcount(graph) < 1) {
+    stop("Invalid or empty graph provided.")
   }
   
-  # Centrality measures
-  degree_centrality <- degree(graph) / (vcount(graph) - 1)
-  closeness_centrality <- closeness(graph)
-  betweenness_centrality <- betweenness(graph, normalized = normalize)
-  eigenvector_centrality <- evcent(graph, scale = normalize)$vector
-  subgraph_centrality <- subgraph_centrality(graph)
+  n <- vcount(graph)
   
-  # Other metrics
-  clustering_coeff <- transitivity(graph, type = "undirected")
+  # Centrality Measures
+  degree_cent <- degree(graph) / (n - 1)
+  closeness_cent <- closeness(graph)
+  betweenness_cent <- betweenness(graph, normalized = normalize)
+  eigen_cent <- eigen_centrality(graph, scale = normalize)$vector
+  subgraph_cent <- compute_subgraph_centrality(graph)
   
-  # Calculate small worldness using igraph
-  rand_graph <- random.graph.game(vcount(graph), p=mean(degree(graph))/(vcount(graph)-1), directed = FALSE)
-  sw <- (mean(transitivity(graph, type = "undirected"))/mean(transitivity(rand_graph, type = "undirected"))) / (mean_distance(graph)/mean_distance(rand_graph))
+  # Clustering Coefficient (global)
+  clust_coeff <- transitivity(if (is_directed(graph)) as.undirected(graph, mode = "collapse") else graph, type = "global")
   
-  core <- coreness(graph)
+  # Small Worldness:
+  p_est <- mean(degree(graph)) / (n - 1)
+  rand_graph <- sample_gnp(n, p = p_est, directed = FALSE)
+  C <- clust_coeff
+  C_rand <- transitivity(rand_graph, type = "global")
+  L <- mean_distance(graph, directed = FALSE)
+  L_rand <- mean_distance(rand_graph, directed = FALSE)
   
-  if (!is.null(label_col) && label_col %in% colnames(df)) {
-    V(graph)$label <- df[[label_col]]
+  if (C_rand == 0 || L_rand == 0 || !is.finite(L) || !is.finite(L_rand)) {
+    small_world <- NA
+  } else {
+    small_world <- (C / C_rand) / (L / L_rand)
   }
+  
+  coreness_val <- coreness(graph)
   
   metrics_df <- data.frame(
     name = V(graph)$name,
     group = V(graph)$group,
-    degree_centrality = degree_centrality,
-    closeness_centrality = closeness_centrality,
-    betweenness_centrality = betweenness_centrality,
-    eigenvector_centrality = eigenvector_centrality,
-    subgraph_centrality = subgraph_centrality,
-    clustering_coefficient = clustering_coeff,
-    small_worldness = sw,
-    coreness = core
+    degree_centrality = degree_cent,
+    closeness_centrality = closeness_cent,
+    betweenness_centrality = betweenness_cent,
+    eigenvector_centrality = eigen_cent,
+    subgraph_centrality = subgraph_cent,
+    clustering_coefficient = clust_coeff,
+    small_worldness = small_world,
+    coreness = coreness_val,
+    stringsAsFactors = FALSE
   )
   
   return(metrics_df)
 }
 
-#' Save network graph
+# -------------------------------
+# 8. save_graph: Save a Network Graph to File
+# -------------------------------
+#' Save a Network Graph Plot to File
 #'
-#' This function saves a network graph to a file in PDF, PNG, JPEG, TIFF, or BMP format.
+#' @param graph An igraph graph object.
+#' @param file_name File name (with or without extension).
+#' @param format Format of the output file (one of "pdf", "png", "jpeg", "tiff", "bmp"). Default is "pdf".
 #'
-#' @param graph A graph object. It should not be NULL and should contain at least one vertex and one edge.
-#' @param file_name A character string specifying the name of the output file.
-#' @param format A character string specifying the format of the output file. The default is "pdf".
-#' @importFrom ggplot2 ggsave
-#' @export
-#'
-#' @return NULL if the graph is NULL
+#' @return (Invisible) NULL. The file is saved to disk.
 save_graph <- function(graph, file_name, format = "pdf") {
-  if (is.null(graph) || vcount(graph) == 0 || ecount(graph) == 0) {
-    cat("Cannot save a NULL or empty graph.\n")
-    return(NULL)
+  if (!inherits(graph, "igraph") || vcount(graph) < 1) {
+    stop("Invalid or empty graph provided; nothing to save.")
+  }
+  fmt <- tolower(format)
+  if (!(fmt %in% c("pdf", "png", "jpeg", "tiff", "bmp"))) {
+    stop("Unsupported file format. Supported formats: pdf, png, jpeg, tiff, bmp.")
   }
   
-  if (tolower(format) %in% c("pdf", "png", "jpeg", "tiff", "bmp")) {
-    g <- plot_graph(graph)
-    ggsave(file_name, g, device = format, dpi = 300)
-  } else {
-    cat("Unsupported file format. Supported formats are: PDF, PNG, JPEG, TIFF, and BMP.\n")
+  # Create the plot using the updated plot_graph() function.
+  p <- plot_graph(graph)
+  
+  # Ensure the file name has the proper extension
+  ext <- tools::file_ext(file_name)
+  if (ext == "") {
+    file_name <- paste0(file_name, ".", fmt)
   }
+  
+  # Suppress messages from ggsave so that expect_silent() passes
+  suppressMessages(ggsave(filename = file_name, plot = p, device = fmt, dpi = 300))
+  invisible(NULL)
 }
 
-#' UAT Example: Generate and analyze synthetic network
-#' 
-#' This script generates a synthetic network using randomly generated edge weights and performs various analyses on the network. 
-#' 
-#' @import igraph
-#' @importFrom ggplot2 ggtitle
-#'
-#' @examples
-#' # Generate synthetic dataset
-#' set.seed(123)
-#' 
-#' example_df <- data.frame(
-#'   source = c("A", "A", "B", "C", "C", "D", "E", "E"),
-#'   target = c("B", "C", "C", "D", "E", "E", "F", "G"),
-#'   weight = c(1, 5, 3, 4, 2, 1, 3, 6)
-#' )
-#' 
-#' example_graph <- create_graph(
-#'   df = example_df,
-#'   from_col = "source",
-#'   to_col = "target",
-#'   directed = FALSE,
-#'   weight_col = "weight"
-#' )
-#' 
-#' # Summarize graph
-#' summary_info <- group_summary(example_graph)
-#' 
-#' # Plot graph
-#' graph_plot <- plot_graph(example_graph, title = "Synthetic Network")
-#' graph_plot
-#' 
-#' # Look at distribution of degrees
-#' degree_dist_plot <- plot_degree_distribution(graph, title = "Degree Distribution (Synthetic Network)")
-#' 
-#' # Compare graph (specifying 1 graph)
-#' compare_graphs(example_graph)
-#' 
-#' # Create a second data set
-#' example_df2 <- data.frame(
-#'   source = c("A", "A", "B", "C", "C", "D", "E", "F"),
-#'   target = c("B", "C", "C", "D", "E", "E", "F", "B"),
-#'   weight = c(2, 6, 6, 1, 2, 2, 4, 1)
-#' )
-#'
-#' # Create second graph
-#' example_graph2 <- create_graph(
-#'   df = example_df2,
-#'   from_col = "source",
-#'   to_col = "target",
-#'   directed = FALSE,
-#'   weight_col = "weight"
-#' )
-#' 
-#' # Compare two networks
-#' compare_graphs(example_graph, example_graph2)
-#' 
-#' # Assess network overlap
-#' overlap <- network_overlap(example_graph, example_graph2)
-#' 
-#' # Calculate network metrics
-#' metric_values <- network_metrics(example_graph)
-#' 
-#' # Test save_graph function
-#' # Uncomment the following line to save the graph as a PDF
-#' # save_graph(example_graph, "synthetic_network.pdf")
-#'
-#' @export
+# -------------------------------
+# User Acceptance Testing (UAT) using testthat
+# -------------------------------
+cat("\n================== Running UAT ==================\n")
+
+# Create a synthetic data frame for testing
+test_df <- data.frame(
+  source = c("A", "A", "B", "C", "C", "D", "E", "E"),
+  target = c("B", "C", "C", "D", "E", "E", "F", "G"),
+  weight = c(1, 5, 3, 4, 2, 1, 3, 6),
+  stringsAsFactors = FALSE
+)
+
+test_that("create_graph works correctly", {
+  # Valid graph creation
+  g <- create_graph(test_df, from_col = "source", to_col = "target", directed = FALSE, weight_col = "weight")
+  expect_true(inherits(g, "igraph"))
+  expect_true(vcount(g) > 0)
+  expect_true(!is.null(V(g)$group))
+  
+  # Data frame missing required columns
+  expect_error(create_graph(test_df, from_col = "foo", to_col = "target"))
+  
+  # Data frame with duplicates should still create a graph
+  df_dup <- rbind(test_df, test_df[1, ])
+  g2 <- create_graph(df_dup, from_col = "source", to_col = "target")
+  expect_true(vcount(g2) > 0)
+})
+
+test_that("group_summary works correctly", {
+  g <- create_graph(test_df, from_col = "source", to_col = "target")
+  summary_info <- group_summary(g, verbose = FALSE)
+  expect_true(is.list(summary_info))
+  expect_true("num_groups" %in% names(summary_info))
+  
+  # Passing an empty graph should error
+  g_empty <- make_empty_graph()
+  expect_error(group_summary(g_empty))
+})
+
+test_that("plot_graph returns a ggplot object", {
+  g <- create_graph(test_df, from_col = "source", to_col = "target")
+  p <- plot_graph(g, title = "Test Network")
+  expect_true(inherits(p, "ggplot"))
+  
+  # Test additional aesthetics layers (using a named list)
+  p2 <- plot_graph(g, node_extra = list(fill = "red", shape = 21),
+                   edge_extra = list(color = "gray", alpha = 0.5))
+  expect_true(inherits(p2, "ggplot"))
+})
+
+test_that("plot_degree_distribution returns a ggplot object", {
+  g <- create_graph(test_df, from_col = "source", to_col = "target")
+  p <- plot_degree_distribution(g, ccdf = FALSE)
+  expect_true(inherits(p, "ggplot"))
+  p_ccdf <- plot_degree_distribution(g, ccdf = TRUE)
+  expect_true(inherits(p_ccdf, "ggplot"))
+})
+
+test_that("compare_graphs works correctly", {
+  g1 <- create_graph(test_df, from_col = "source", to_col = "target")
+  # Create a second graph with a slight change
+  test_df2 <- data.frame(
+    source = c("A", "A", "B", "C", "C", "D", "E", "F"),
+    target = c("B", "C", "C", "D", "E", "E", "F", "B"),
+    weight = c(2, 6, 6, 1, 2, 2, 4, 1),
+    stringsAsFactors = FALSE
+  )
+  g2 <- create_graph(test_df2, from_col = "source", to_col = "target")
+  
+  comp <- compare_graphs(g1, g2)
+  expect_true(is.list(comp))
+  expect_true("modularities" %in% names(comp))
+  
+  # Passing a NULL graph should error
+  expect_error(compare_graphs(g1, NULL))
+})
+
+test_that("network_overlap works correctly", {
+  g1 <- create_graph(test_df, from_col = "source", to_col = "target")
+  test_df2 <- data.frame(
+    source = c("A", "B", "E"),
+    target = c("B", "C", "F"),
+    weight = c(1, 2, 3),
+    stringsAsFactors = FALSE
+  )
+  g2 <- create_graph(test_df2, from_col = "source", to_col = "target")
+  overlap <- network_overlap(g1, g2)
+  expect_true(is.list(overlap))
+  expect_true(overlap$num_common_nodes >= 0)
+  
+  # Passing an empty graph should error
+  g_empty <- make_empty_graph()
+  expect_error(network_overlap(g1, g_empty))
+})
+
+test_that("network_metrics works correctly", {
+  g <- create_graph(test_df, from_col = "source", to_col = "target")
+  metrics <- network_metrics(g, normalize = TRUE)
+  expect_true(is.data.frame(metrics))
+  expect_equal(nrow(metrics), vcount(g))
+  
+  # For an empty graph, expect an error
+  g_empty <- make_empty_graph()
+  expect_error(network_metrics(g_empty))
+})
+
+test_that("save_graph works correctly", {
+  g <- create_graph(test_df, from_col = "source", to_col = "target")
+  temp_file <- tempfile(fileext = ".pdf")
+  expect_silent(save_graph(g, file_name = temp_file, format = "pdf"))
+  expect_true(file.exists(temp_file))
+  unlink(temp_file)  # Clean up
+  
+  # Unsupported format should error
+  expect_error(save_graph(g, file_name = "test_graph.xyz", format = "xyz"))
+  
+  # Empty graph should error
+  g_empty <- make_empty_graph()
+  expect_error(save_graph(g_empty, file_name = "dummy.pdf"))
+})
+
+cat("\n================== All UAT tests passed ==================\n")
