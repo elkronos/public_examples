@@ -1,234 +1,415 @@
-#' Scatter Plot of Rescaled Variables with Optional Annotations
-#'
-#' This function creates a scatter plot of two rescaled numeric variables from a data frame, with optional annotations such as
-#' the Pearson correlation coefficient and quadrant percentages. It supports both static (ggplot2) and interactive (plotly) plots.
-#'
-#' @param data A data frame containing the variables.
-#' @param x Unquoted name of the x variable (must be numeric).
-#' @param y Unquoted name of the y variable (must be numeric).
-#' @param r_label Logical. If TRUE, the Pearson correlation coefficient is displayed on the plot. Default is TRUE.
-#' @param save_path Character. File path to save the plot. If NULL (default), the plot is not saved.
-#' @param interactive Logical. If TRUE, returns an interactive plotly object. Default is FALSE.
-#' @param annotate_quadrants Logical. If TRUE, annotates the plot with quadrant percentages. Default is FALSE.
-#' @return A ggplot object or an interactive plotly object, depending on the 'interactive' parameter.
-#' @examples
-#' # Basic static plot:
-#' scatter_norm(mtcars, mpg, disp)
-#'
-#' # Interactive plot with quadrant annotations:
-#' scatter_norm(mtcars, mpg, disp, interactive = TRUE, annotate_quadrants = TRUE)
-#'
-#' # Plot without correlation label:
-#' scatter_norm(mtcars, mpg, disp, r_label = FALSE)
-#'
-#' # Save plot to file:
-#' scatter_norm(mtcars, mpg, disp, save_path = "my_plot.png")
-#' @import ggplot2
-#' @importFrom plotly ggplotly
-#' @importFrom rlang ensym as_string
-#' @export
-scatter_norm <- function(data, x, y, r_label = TRUE, save_path = NULL,
-                         interactive = FALSE, annotate_quadrants = FALSE) {
-  # Validate that 'data' is a data frame
-  if (!is.data.frame(data)) {
-    stop("`data` must be a data frame.")
-  }
+# scatter_norm.R
+# Dependencies: ggplot2, rlang, plotly
+
+# ---------------------------
+# Internal helpers
+# ---------------------------
+
+.sn_abort <- function(msg) rlang::abort(msg, call = NULL)
+
+.sn_assert_df <- function(x) {
+  if (!is.data.frame(x)) .sn_abort("`data` must be a data frame.")
+}
+
+.sn_assert_col <- function(df, nm) {
+  if (!nm %in% names(df)) .sn_abort(paste0("Column `", nm, "` not found in `data`."))
+}
+
+.sn_assert_numeric <- function(v, nm) {
+  if (!is.numeric(v)) .sn_abort(paste0("Column `", nm, "` must be numeric."))
+}
+
+.sn_zscore <- function(v, nm) {
+  m <- mean(v)
+  s <- stats::sd(v)
+  if (is.na(s) || s == 0) .sn_abort(paste0("Standard deviation is zero/NA for `", nm, "`. Cannot rescale."))
+  (v - m) / s
+}
+
+.sn_quo_to_colname <- function(q, arg_name = "aesthetic") {
+  if (rlang::quo_is_null(q)) return(NULL)
+  expr <- rlang::get_expr(q)
+  if (rlang::is_symbol(expr)) return(rlang::as_name(expr))
+  if (is.character(expr) && length(expr) == 1) return(expr)
+  .sn_abort(paste0("`", arg_name, "` must be an unquoted column name or a single string."))
+}
+
+.sn_capture_optional_mapping <- function(data, color_q, fill_q, shape_q) {
+  color_name <- .sn_quo_to_colname(color_q, "color")
+  fill_name  <- .sn_quo_to_colname(fill_q,  "fill")
+  shape_name <- .sn_quo_to_colname(shape_q, "shape")
   
-  # Capture column names using tidy evaluation (from rlang)
-  x_sym <- rlang::ensym(x)
-  y_sym <- rlang::ensym(y)
-  x_name <- rlang::as_string(x_sym)
-  y_name <- rlang::as_string(y_sym)
+  if (!is.null(color_name)) .sn_assert_col(data, color_name)
+  if (!is.null(fill_name))  .sn_assert_col(data, fill_name)
+  if (!is.null(shape_name)) .sn_assert_col(data, shape_name)
   
-  # Check that the specified columns exist
-  if (!x_name %in% names(data)) {
-    stop(paste("Column", x_name, "not found in data."))
-  }
-  if (!y_name %in% names(data)) {
-    stop(paste("Column", y_name, "not found in data."))
-  }
+  list(color = color_name, fill = fill_name, shape = shape_name)
+}
+
+.sn_drop_complete_xy <- function(data, x_name, y_name) {
+  keep <- stats::complete.cases(data[[x_name]], data[[y_name]])
+  out <- data[keep, , drop = FALSE]
+  if (nrow(out) < 2) .sn_abort("Not enough complete cases for analysis (need at least 2 rows).")
+  out
+}
+
+.sn_make_tooltip <- function(x_name, y_name, x_use, y_use, xz, yz) {
+  paste0(
+    x_name, ": ", signif(x_use, 4),
+    "<br>", y_name, ": ", signif(y_use, 4),
+    "<br>", "x_z: ", signif(xz, 4),
+    "<br>", "y_z: ", signif(yz, 4)
+  )
+}
+
+.sn_prepare_plot_df <- function(data_complete, x_name, y_name) {
+  x_use <- data_complete[[x_name]]
+  y_use <- data_complete[[y_name]]
   
-  # Ensure the variables are numeric
-  if (!is.numeric(data[[x_name]])) {
-    stop(paste("Column", x_name, "must be numeric."))
-  }
-  if (!is.numeric(data[[y_name]])) {
-    stop(paste("Column", y_name, "must be numeric."))
-  }
+  xz <- .sn_zscore(x_use, x_name)
+  yz <- .sn_zscore(y_use, y_name)
   
-  # Remove missing values
-  data_complete <- data[stats::complete.cases(data[[x_name]], data[[y_name]]), ]
-  if (nrow(data_complete) < 2) {
-    stop("Not enough complete cases for analysis.")
-  }
+  df_plot <- data_complete
+  df_plot$.row       <- seq_along(xz)
+  df_plot$x_rescaled <- xz
+  df_plot$y_rescaled <- yz
+  df_plot$.tooltip   <- .sn_make_tooltip(x_name, y_name, x_use, y_use, xz, yz)
   
-  # Helper function to rescale a vector (centering and scaling)
-  rescale_vector <- function(vec) {
-    sd_vec <- stats::sd(vec)
-    if (sd_vec == 0) {
-      stop("Standard deviation is zero. Cannot rescale a constant vector.")
-    }
-    (vec - mean(vec)) / sd_vec
-  }
-  
-  # Rescale x and y
-  x_rescaled <- rescale_vector(data_complete[[x_name]])
-  y_rescaled <- rescale_vector(data_complete[[y_name]])
-  
-  df_plot <- data.frame(x_rescaled = x_rescaled, y_rescaled = y_rescaled)
-  
-  # Create the base ggplot
-  p <- ggplot2::ggplot(df_plot, ggplot2::aes(x = x_rescaled, y = y_rescaled)) +
-    ggplot2::geom_point() +
-    ggplot2::geom_smooth(method = "loess", se = TRUE)
-  
-  # Add the correlation coefficient annotation if requested
-  if (r_label) {
-    r_value <- cor(data_complete[[x_name]], data_complete[[y_name]])
-    r_value <- round(r_value, 2)
-    label_text <- paste("r =", r_value)
-    # Place the label at the top-left corner of the plot area
-    x_pos <- min(x_rescaled, na.rm = TRUE)
-    y_pos <- max(y_rescaled, na.rm = TRUE)
-    p <- p + ggplot2::annotate("text", x = x_pos, y = y_pos, label = label_text,
-                               hjust = 0, vjust = 1, fontface = "italic", color = "darkblue", alpha = 0.6)
-  }
-  
-  # Add quadrant annotations if requested
-  if (annotate_quadrants) {
-    if (length(x_rescaled) < 4) {
-      warning("Not enough points to reliably annotate quadrants.")
-    } else {
-      # Define quadrants:
-      # Q1: x>0, y>0; Q2: x<=0, y>0; Q3: x<=0, y<=0; Q4: x>0, y<=0.
-      count_q1 <- sum(x_rescaled > 0 & y_rescaled > 0)
-      count_q2 <- sum(x_rescaled <= 0 & y_rescaled > 0)
-      count_q3 <- sum(x_rescaled <= 0 & y_rescaled <= 0)
-      count_q4 <- sum(x_rescaled > 0 & y_rescaled <= 0)
-      counts <- c(count_q1, count_q2, count_q3, count_q4)
-      total <- sum(counts)
-      percentages <- round((counts / total) * 100, 1)
-      quadrant_labels <- paste0(c("Q1: ", "Q2: ", "Q3: ", "Q4: "), percentages, "%")
-      
-      # Determine annotation positions using quantiles
-      x_positions <- c(stats::quantile(x_rescaled, 0.75),
-                       stats::quantile(x_rescaled, 0.25),
-                       stats::quantile(x_rescaled, 0.25),
-                       stats::quantile(x_rescaled, 0.75))
-      y_positions <- c(stats::quantile(y_rescaled, 0.75),
-                       stats::quantile(y_rescaled, 0.75),
-                       stats::quantile(y_rescaled, 0.25),
-                       stats::quantile(y_rescaled, 0.25))
-      
-      for (i in seq_along(quadrant_labels)) {
-        p <- p + ggplot2::annotate("text", x = x_positions[i], y = y_positions[i],
-                                   label = quadrant_labels[i],
-                                   hjust = 0, vjust = 1, fontface = "italic", color = "darkred", alpha = 0.6)
-      }
-    }
-  }
-  
-  # Add reference lines, axis labels, and a minimal theme
-  p <- p +
-    ggplot2::geom_hline(yintercept = 0, linewidth = 1, linetype = "dashed") +
-    ggplot2::geom_vline(xintercept = 0, linewidth = 1, linetype = "dashed") +
-    ggplot2::xlab(paste("Rescaled", x_name)) +
-    ggplot2::ylab(paste("Rescaled", y_name)) +
-    ggplot2::coord_equal() +
-    ggplot2::theme_minimal()
-  
-  # Save the plot if a file path is provided
-  if (!is.null(save_path)) {
-    tryCatch({
-      ggplot2::ggsave(filename = save_path, plot = p)
-    }, error = function(e) {
-      warning("Could not save the plot: ", e$message)
-    })
-  }
-  
-  # Return an interactive plotly object if requested; otherwise, return the ggplot object
-  if (interactive) {
-    return(plotly::ggplotly(p))
+  list(df_plot = df_plot, x_use = x_use, y_use = y_use, xz = xz, yz = yz)
+}
+
+.sn_quadrant_cut <- function(xz, yz, quadrant_cut) {
+  if (quadrant_cut == "median") {
+    list(cut_x = stats::median(xz), cut_y = stats::median(yz))
   } else {
-    return(p)
+    list(cut_x = 0, cut_y = 0)
   }
 }
 
-if (interactive()) {  # Only run tests interactively or within a test suite
-  library(testthat)
-  library(ggplot2)
-  library(plotly)
+.sn_quadrant_stats <- function(xz, yz, cut_x, cut_y, digits = 1L) {
+  q1 <- sum(xz >  cut_x & yz >  cut_y)
+  q2 <- sum(xz <= cut_x & yz >  cut_y)
+  q3 <- sum(xz <= cut_x & yz <= cut_y)
+  q4 <- sum(xz >  cut_x & yz <= cut_y)
   
-  context("Testing scatter_norm function")
+  counts <- c(q1, q2, q3, q4)
+  total <- sum(counts)
+  pct <- if (total == 0) rep(0, 4) else round((counts / total) * 100, digits)
   
-  test_that("Basic functionality with valid numeric columns", {
-    p <- scatter_norm(mtcars, mpg, disp)
-    expect_s3_class(p, "ggplot")
-  })
+  data.frame(
+    quadrant = c("Q1", "Q2", "Q3", "Q4"),
+    count = counts,
+    pct = pct,
+    label = paste0(c("Q1: ", "Q2: ", "Q3: ", "Q4: "), pct, "%"),
+    stringsAsFactors = FALSE
+  )
+}
+
+.sn_quadrant_label_positions <- function(xz, yz) {
+  data.frame(
+    x = c(stats::quantile(xz, 0.75), stats::quantile(xz, 0.25),
+          stats::quantile(xz, 0.25), stats::quantile(xz, 0.75)),
+    y = c(stats::quantile(yz, 0.75), stats::quantile(yz, 0.75),
+          stats::quantile(yz, 0.25), stats::quantile(yz, 0.25))
+  )
+}
+
+.sn_compute_cor_stats <- function(x_use, y_use, r_method, r_digits, r_show_p, r_show_n) {
+  ct <- stats::cor.test(x_use, y_use, method = r_method)
+  r_val <- unname(ct$estimate)
+  r_txt <- format(round(r_val, r_digits), nsmall = r_digits)
   
-  test_that("Interactive plot returns a plotly object", {
-    p <- scatter_norm(mtcars, mpg, disp, interactive = TRUE)
-    expect_s3_class(p, "plotly")
-  })
+  p_txt <- NULL
+  if (isTRUE(r_show_p)) {
+    p <- ct$p.value
+    p_txt <- if (is.na(p)) "NA" else if (p < 0.001) "< 0.001" else format(round(p, 3), nsmall = 3)
+  }
   
-  test_that("Correlation label is omitted when r_label is FALSE", {
-    p <- scatter_norm(mtcars, mpg, disp, r_label = FALSE)
-    # Check that no annotation layer contains the correlation label text "r ="
-    annotations <- vapply(p$layers, function(layer) {
-      if (!is.null(layer$geom_params$label)) layer$geom_params$label else ""
-    }, character(1))
-    expect_false(any(grepl("r =", annotations, fixed = TRUE)))
-  })
+  lab <- paste0("r = ", r_txt)
+  if (isTRUE(r_show_p)) lab <- paste0(lab, "  ·  p ", p_txt)
+  if (isTRUE(r_show_n)) lab <- paste0(lab, "  ·  n = ", length(x_use))
   
-  test_that("Quadrant annotations are added when requested", {
-    p <- scatter_norm(mtcars, mpg, disp, annotate_quadrants = TRUE)
-    expect_s3_class(p, "ggplot")
+  list(label = lab, r = r_val, p_value = ct$p.value)
+}
+
+.sn_quosure <- function(expr) rlang::new_quosure(expr, env = rlang::empty_env())
+
+.sn_build_mapping <- function(map_names, include_text = FALSE) {
+  m <- list(
+    x = .sn_quosure(rlang::sym("x_rescaled")),
+    y = .sn_quosure(rlang::sym("y_rescaled"))
+  )
+  
+  if (isTRUE(include_text)) {
+    m$text <- .sn_quosure(rlang::sym(".tooltip"))
+  }
+  
+  if (!is.null(map_names$color)) m$colour <- .sn_quosure(rlang::sym(map_names$color))
+  if (!is.null(map_names$fill))  m$fill   <- .sn_quosure(rlang::sym(map_names$fill))
+  if (!is.null(map_names$shape)) m$shape  <- .sn_quosure(rlang::sym(map_names$shape))
+  
+  class(m) <- "uneval"
+  m
+}
+
+.sn_apply_style_preset <- function(style, theme, point_args, smooth_args, fill_mapped) {
+  if (style != "clean") {
+    if (isTRUE(fill_mapped) && is.null(point_args$shape))  point_args$shape  <- 21
+    if (isTRUE(fill_mapped) && is.null(point_args$stroke)) point_args$stroke <- 0.4
+    return(list(theme = theme, point_args = point_args, smooth_args = smooth_args))
+  }
+  
+  if (missing(theme)) {
+    theme <- ggplot2::theme_minimal(base_size = 13) +
+      ggplot2::theme(
+        panel.grid.minor = ggplot2::element_blank(),
+        panel.grid.major = ggplot2::element_line(linewidth = 0.25),
+        axis.title       = ggplot2::element_text(face = "bold"),
+        plot.margin      = ggplot2::margin(10, 12, 10, 12)
+      )
+  }
+  
+  point_args <- utils::modifyList(list(size = 2.2, alpha = 0.85), point_args)
+  
+  if (isTRUE(fill_mapped) && is.null(point_args$shape))  point_args$shape  <- 21
+  if (isTRUE(fill_mapped) && is.null(point_args$stroke)) point_args$stroke <- 0.4
+  
+  smooth_args <- utils::modifyList(list(se = TRUE), smooth_args)
+  
+  list(theme = theme, point_args = point_args, smooth_args = smooth_args)
+}
+
+.sn_resolve_smoother <- function(
+    smooth, smooth_method, smooth_args,
+    loess_span,
+    loess_family, loess_family_provided,
+    style_clean,
+    smooth_group
+) {
+  if (!isTRUE(smooth) || smooth_method == "none") return(NULL)
+  
+  if (is.null(smooth_args$method)) smooth_args$method <- smooth_method
+  method <- smooth_args$method
+  
+  if (identical(method, "loess")) {
+    if (!is.null(loess_span) && is.null(smooth_args$span)) smooth_args$span <- loess_span
+    if (isTRUE(style_clean) && is.null(smooth_args$span) && is.null(loess_span)) smooth_args$span <- 0.9
+  }
+  
+  method_args <- smooth_args$method.args
+  if (is.null(method_args)) method_args <- list()
+  
+  if (!is.null(smooth_args$family)) {
+    method_args$family <- smooth_args$family
+    smooth_args$family <- NULL
+  }
+  
+  if (identical(method, "loess")) {
+    if (isTRUE(loess_family_provided)) {
+      fam <- match.arg(loess_family, c("gaussian", "symmetric"))
+      if (is.null(method_args$family)) method_args$family <- fam
+    } else if (isTRUE(style_clean) && is.null(method_args$family)) {
+      method_args$family <- "symmetric"
+    }
+  }
+  
+  if (length(method_args) > 0) smooth_args$method.args <- method_args
+  
+  if (is.null(smooth_args$linewidth)) smooth_args$linewidth <- 1.0
+  smooth_args$size <- NULL
+  
+  if (smooth_group == "overall") {
+    if (is.null(smooth_args$inherit.aes)) smooth_args$inherit.aes <- FALSE
+    smooth_args$mapping <- ggplot2::aes(x = x_rescaled, y = y_rescaled, group = 1)
+  }
+  
+  smooth_args
+}
+
+.sn_add_annotation_layer <- function(p, data, mapping, interactive, ...) {
+  if (isTRUE(interactive)) {
+    p + ggplot2::geom_text(data = data, mapping = mapping, inherit.aes = FALSE, ...)
+  } else {
+    p + ggplot2::geom_label(data = data, mapping = mapping, inherit.aes = FALSE, label.size = 0, ...)
+  }
+}
+
+.sn_add_ref_lines <- function(p, cut_x, cut_y) {
+  p +
+    ggplot2::geom_hline(yintercept = cut_y, linewidth = 0.6, linetype = "dashed") +
+    ggplot2::geom_vline(xintercept = cut_x, linewidth = 0.6, linetype = "dashed")
+}
+
+.sn_save_plot <- function(p, save_path, save_args) {
+  args <- utils::modifyList(list(filename = save_path, plot = p), save_args)
+  tryCatch(
+    do.call(ggplot2::ggsave, args),
+    error = function(e) warning("Could not save the plot: ", e$message, call. = FALSE)
+  )
+}
+
+# ---------------------------
+# Public function
+# ---------------------------
+
+scatter_norm <- function(
+    data, x, y,
+    r_label = TRUE,
+    save_path = NULL,
+    interactive = FALSE,
+    annotate_quadrants = FALSE,
+    r_method = c("pearson", "spearman", "kendall"),
+    r_digits = 2L,
+    r_show_p = FALSE,
+    r_show_n = FALSE,
     
-    # Build the plot to access computed data for all layers
-    built <- ggplot2::ggplot_build(p)
+    smooth = TRUE,
+    smooth_method = c("loess", "lm", "gam", "none"),
+    loess_span = NULL,
+    loess_family = c("gaussian", "symmetric"),
+    smooth_args = list(method = "loess", se = TRUE),
+    smooth_group = c("overall", "mapped"),
     
-    # Extract all labels from all layers (if any)
-    labels_found <- unlist(lapply(built$data, function(layer_data) {
-      if ("label" %in% names(layer_data)) {
-        return(layer_data$label)
-      } else {
-        return(NULL)
-      }
-    }))
+    point_args = list(),
+    color = NULL,
+    fill = NULL,
+    shape = NULL,
     
-    # Check if any of the labels contain a "Q" (indicating quadrant annotation)
-    quadrant_found <- any(grepl("Q", labels_found))
-    expect_true(quadrant_found)
-  })
+    ref_lines = TRUE,
+    quadrant_cut = c("zero", "median"),
+    quadrant_digits = 1L,
+    
+    theme = ggplot2::theme_minimal(),
+    coord_equal = TRUE,
+    style = c("default", "clean"),
+    
+    save_args = list(),
+    return = c("plot", "all")
+) {
+  .sn_assert_df(data)
   
+  x_name <- rlang::as_string(rlang::ensym(x))
+  y_name <- rlang::as_string(rlang::ensym(y))
   
-  test_that("Non-numeric x variable produces an error", {
-    expect_error(scatter_norm(iris, Species, Sepal.Length),
-                 "must be numeric")
-  })
+  .sn_assert_col(data, x_name); .sn_assert_col(data, y_name)
+  .sn_assert_numeric(data[[x_name]], x_name)
+  .sn_assert_numeric(data[[y_name]], y_name)
   
-  test_that("Missing column produces an error", {
-    expect_error(scatter_norm(mtcars, non_existent, disp),
-                 "not found in data")
-  })
+  r_method      <- match.arg(r_method)
+  quadrant_cut  <- match.arg(quadrant_cut)
+  smooth_group  <- match.arg(smooth_group)
+  smooth_method <- match.arg(smooth_method)
+  style         <- match.arg(style)
+  return        <- match.arg(return)
   
-  test_that("Data with insufficient complete cases produces an error", {
-    df <- data.frame(a = as.numeric(c(NA, NA)), b = c(1, 2))
-    expect_error(scatter_norm(df, a, b), "Not enough complete cases")
-  })
+  color_q <- rlang::enquo(color)
+  fill_q  <- rlang::enquo(fill)
+  shape_q <- rlang::enquo(shape)
   
-  test_that("Constant column (zero variance) produces an error", {
-    df <- data.frame(a = rep(1, 10), b = rnorm(10))
-    expect_error(scatter_norm(df, a, b),
-                 "Standard deviation is zero")
-  })
+  map_names <- .sn_capture_optional_mapping(data, color_q, fill_q, shape_q)
   
-  test_that("Plot is successfully saved to file", {
-    tmp_file <- tempfile(fileext = ".png")
-    scatter_norm(mtcars, mpg, disp, save_path = tmp_file)
-    expect_true(file.exists(tmp_file))
-    unlink(tmp_file)  # Clean up
-  })
+  preset <- .sn_apply_style_preset(
+    style = style,
+    theme = theme,
+    point_args = point_args,
+    smooth_args = smooth_args,
+    fill_mapped = !is.null(map_names$fill)
+  )
+  theme <- preset$theme
+  point_args <- preset$point_args
+  smooth_args <- preset$smooth_args
   
-  print("All UAT tests passed successfully!")
+  data_complete <- .sn_drop_complete_xy(data, x_name, y_name)
+  prep <- .sn_prepare_plot_df(data_complete, x_name, y_name)
+  df_plot <- prep$df_plot
+  
+  cuts <- .sn_quadrant_cut(prep$xz, prep$yz, quadrant_cut)
+  
+  cor_stats <- .sn_compute_cor_stats(
+    prep$x_use, prep$y_use,
+    r_method = r_method,
+    r_digits = r_digits,
+    r_show_p = r_show_p,
+    r_show_n = r_show_n
+  )
+  
+  q_stats <- NULL
+  if (isTRUE(annotate_quadrants) && nrow(df_plot) >= 4) {
+    q_stats <- .sn_quadrant_stats(prep$xz, prep$yz, cuts$cut_x, cuts$cut_y, digits = quadrant_digits)
+    pos <- .sn_quadrant_label_positions(prep$xz, prep$yz)
+    q_stats$x <- pos$x; q_stats$y <- pos$y
+  } else if (isTRUE(annotate_quadrants) && nrow(df_plot) < 4) {
+    warning("Not enough points to reliably annotate quadrants (need >= 4).", call. = FALSE)
+  }
+  
+  stats_out <- list(
+    n = nrow(df_plot),
+    r = cor_stats$r,
+    r_method = r_method,
+    p_value = cor_stats$p_value,
+    quadrant_cut = quadrant_cut,
+    cut_x = cuts$cut_x,
+    cut_y = cuts$cut_y,
+    quadrants = q_stats
+  )
+  
+  mapping <- .sn_build_mapping(map_names, include_text = isTRUE(interactive))
+  p <- ggplot2::ggplot(df_plot, mapping)
+  
+  p <- p + do.call(ggplot2::geom_point, point_args)
+  
+  smooth_layer_args <- .sn_resolve_smoother(
+    smooth = smooth,
+    smooth_method = smooth_method,
+    smooth_args = smooth_args,
+    loess_span = loess_span,
+    loess_family = loess_family,
+    loess_family_provided = !missing(loess_family),
+    style_clean = (style == "clean"),
+    smooth_group = smooth_group
+  )
+  if (!is.null(smooth_layer_args)) {
+    p <- p + do.call(ggplot2::geom_smooth, smooth_layer_args)
+  }
+  
+  if (isTRUE(ref_lines)) {
+    p <- .sn_add_ref_lines(p, cuts$cut_x, cuts$cut_y)
+  }
+  
+  if (isTRUE(r_label)) {
+    r_df <- data.frame(label = cor_stats$label)
+    p <- .sn_add_annotation_layer(
+      p,
+      data = r_df,
+      mapping = ggplot2::aes(x = -Inf, y = Inf, label = label),
+      interactive = interactive,
+      hjust = -0.05, vjust = 1.1, alpha = 0.6
+    )
+  }
+  
+  if (!is.null(q_stats) && nrow(q_stats) == 4) {
+    p <- .sn_add_annotation_layer(
+      p,
+      data = q_stats,
+      mapping = ggplot2::aes(x = x, y = y, label = label),
+      interactive = interactive,
+      alpha = 0.5
+    )
+  }
+  
+  p <- p +
+    ggplot2::labs(
+      x = paste0("Rescaled ", x_name, " (z)"),
+      y = paste0("Rescaled ", y_name, " (z)")
+    ) +
+    theme
+  
+  if (isTRUE(coord_equal)) p <- p + ggplot2::coord_equal()
+  
+  if (!is.null(save_path)) .sn_save_plot(p, save_path, save_args)
+  
+  out_plot <- if (isTRUE(interactive)) plotly::ggplotly(p, tooltip = "text") else p
+  
+  if (return == "all") return(list(plot = out_plot, data = df_plot, stats = stats_out))
+  out_plot
 }
