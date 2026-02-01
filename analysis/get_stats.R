@@ -1,664 +1,1036 @@
-# --- Calculate the Mode(s) of a Vector ---
-#' Calculate the Mode(s) of a Vector
-#'
-#' This function computes the mode(s) of an input vector by removing any missing values and then
-#' identifying the element(s) that occur most frequently. Depending on the `return_type` parameter,
-#' the mode(s) are returned as a concatenated string, a numeric vector, the first mode, or a count of modes.
-#'
-#' @param x A numeric or factor vector. NA values are removed prior to computation.
-#' @param return_type A character string specifying the format of the returned value. Options include:
-#'   \itemize{
-#'     \item \code{"string"}: Returns the modes as a comma-separated string.
-#'     \item \code{"vector"}: Returns the modes as a numeric vector.
-#'     \item \code{"first"}: Returns the first mode found as a numeric value.
-#'     \item \code{"count"}: Returns the number of modes.
-#'   }
-#'
-#' @return Depending on \code{return_type}, one of:
-#'   \itemize{
-#'     \item A string with the mode(s).
-#'     \item A numeric vector of mode(s).
-#'     \item A numeric value representing the first mode.
-#'     \item A numeric value representing the count of modes.
-#'   }
-#'
-#' @export
-calculate_mode <- function(x, return_type = "string") {
-  valid_return_types <- c("string", "vector", "first", "count")
-  if (!(return_type %in% valid_return_types)) {
-    stop("Invalid return_type. Choose from: ", paste(valid_return_types, collapse = ", "))
-  }
+# -----------------------
+# Internal utilities
+# -----------------------
+
+.stopf <- function(fmt, ...) stop(sprintf(fmt, ...), call. = FALSE)
+
+.require_pkg <- function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) .stopf("Package '%s' is required.", pkg)
+  invisible(TRUE)
+}
+
+.is_empty <- function(x) length(x) == 0L
+
+.na_scalar <- function(x) {
+  if (is.factor(x)) return(factor(NA, levels = levels(x)))
+  if (inherits(x, "Date")) return(as.Date(NA))
+  if (inherits(x, "POSIXt")) return(as.POSIXct(NA))
+  if (is.character(x)) return(NA_character_)
+  if (is.integer(x)) return(NA_integer_)
+  if (is.numeric(x)) return(NA_real_)
+  NA
+}
+
+.safe_mean <- function(x) {
   x <- x[!is.na(x)]
-  if (length(x) == 0) return(NA)
-  freq <- table(x)
-  modes <- names(freq)[freq == max(freq)]
-  if (return_type == "vector") {
-    return(as.numeric(as.character(modes)))
-  } else if (return_type == "first") {
-    return(as.numeric(as.character(modes[1])))
-  } else if (return_type == "count") {
-    return(length(modes))
-  } else {
-    return(paste(modes, collapse = ", "))
-  }
+  if (.is_empty(x)) return(NA_real_)
+  mean(x)
 }
 
-# --- Safely Convert Input to a Numeric Vector ---
-#' Safely Convert Input to a Numeric Vector
+.safe_min <- function(x) {
+  x <- x[!is.na(x)]
+  if (.is_empty(x)) return(NA)
+  min(x)
+}
+
+.safe_max <- function(x) {
+  x <- x[!is.na(x)]
+  if (.is_empty(x)) return(NA)
+  max(x)
+}
+
+.safe_div <- function(num, den) ifelse(den == 0, NA_real_, num / den)
+
+#' Convert values to Date
 #'
-#' This function attempts to convert an input vector to numeric. It handles inputs that are already numeric,
-#' factors, or character vectors. For factors, the conversion is done via character conversion. If the conversion
-#' fails, an NA vector is returned.
+#' Converts a vector to Date while handling Date, POSIXt, and character inputs.
+#' Character inputs are parsed using POSIXct with a configurable set of formats.
 #'
-#' @param x The input vector to be converted. It can be numeric, factor, or character.
+#' @param x Vector to convert.
+#' @param tz Timezone used when parsing character values via POSIXct.
+#' @param try_formats Character vector of formats tried for character parsing.
 #'
-#' @return A numeric vector if conversion is successful; otherwise, a vector of NA values of the same length as \code{x}.
-#'
+#' @return A Date vector.
 #' @export
-safe_numeric <- function(x) {
-  if (DEBUG) {
-    flog.info("safe_numeric: Original class: %s", class(x))
-    flush.console()
-    flog.info("safe_numeric: Head: %s", paste(utils::head(x), collapse = ", "))
-    flush.console()
-    flog.debug("safe_numeric: Structure:")
-    str(x)
-    flush.console()
-  }
-  if (is.numeric(x)) {
-    flog.info("safe_numeric: Already numeric.")
-    flush.console()
-    return(x)
-  }
-  if (is.factor(x)) {
-    flog.info("safe_numeric: Converting factor via as.character.")
-    flush.console()
-    y <- suppressWarnings(as.numeric(as.character(x)))
-    if (all(is.na(y)) && !all(is.na(x))) {
-      flog.error("safe_numeric: Conversion from factor resulted in all NAs.")
-      flush.console()
-      return(rep(NA_real_, length(x)))
-    }
-    return(y)
-  }
+as_date_safe <- function(
+    x,
+    tz = "UTC",
+    try_formats = c(
+      "%Y-%m-%d", "%Y/%m/%d",
+      "%m/%d/%Y", "%d/%m/%Y",
+      "%m-%d-%Y", "%d-%m-%Y",
+      "%Y%m%d"
+    )
+) {
+  if (inherits(x, "Date")) return(x)
+  if (inherits(x, "POSIXt")) return(as.Date(x))
+  
   if (is.character(x)) {
-    flog.info("safe_numeric: Attempting conversion from character.")
-    flush.console()
-    y <- suppressWarnings(as.numeric(x))
-    if ((all(is.na(y)) && any(!is.na(x))) || length(y) == 0) {
-      flog.error("safe_numeric: Conversion from character failed; input head: %s", paste(utils::head(x), collapse = ", "))
-      flush.console()
-      return(rep(NA_real_, length(x)))
-    }
-    return(y)
+    px <- suppressWarnings(as.POSIXct(x, tz = tz, tryFormats = try_formats))
+    return(as.Date(px))
   }
-  flog.error("safe_numeric: Unhandled type; returning NA vector.")
-  flush.console()
-  rep(NA_real_, length(x))
+  
+  suppressWarnings(as.Date(x))
 }
 
-# --- Compute Date Statistics from a Vector of Dates ---
-#' Compute Date Statistics from a Vector of Dates
+# -----------------------
+# Mode
+# -----------------------
+
+#' Mode of a vector
 #'
-#' This function calculates various statistics for a vector of dates, such as the span between the minimum and maximum dates,
-#' the number of invalid (NA) entries, the middle date, average and median gaps between consecutive dates, and details on streaks (longest and shortest)
-#' as well as the maximum and minimum gaps. The input is coerced to \code{Date} if necessary.
+#' Computes the most frequent value(s) in a vector, with configurable output formats
+#' and tie-handling behavior.
 #'
-#' @param dates A vector containing date values or date-convertable strings.
+#' @param x Atomic vector or factor.
+#' @param return_type One of: "string", "vector", "first", "count".
+#' @param na_rm Remove NAs before computing.
+#' @param ties One of: "all", "first".
+#' @param tie_break One of: "first", "smallest", "largest" (used when ties="first").
+#' @param sep Separator used when return_type="string".
+#' @param keep_class Keep original class for "vector"/"first" where possible.
 #'
-#' @return A list with the following elements:
-#'   \item{span}{The numeric difference (in days) between the maximum and minimum valid dates.}
-#'   \item{invalid}{The count of NA values in the original input.}
-#'   \item{middle_date}{The date representing the middle of the span.}
-#'   \item{avg_gap}{The average gap (in days) between consecutive dates.}
-#'   \item{median_gap}{The median gap (in days) between consecutive dates.}
-#'   \item{longest_streak}{The longest consecutive streak of dates (days with a one-day gap) plus one (to count the start date).}
-#'   \item{shortest_streak}{The shortest consecutive streak of dates (days with a one-day gap) plus one.}
-#'   \item{max_gap}{The maximum gap (in days) between consecutive dates.}
-#'   \item{min_gap}{The minimum gap (in days) between consecutive dates.}
-#'
+#' @return Depending on return_type:
+#'   - "string": a delimited character string of modes
+#'   - "vector": a vector of modes
+#'   - "first": a single mode value
+#'   - "count": the number of modes
 #' @export
-get_date_stats <- function(dates) {
-  assertthat::assert_that(is.vector(dates), msg = "dates must be a vector")
-  if (!inherits(dates, "Date")) dates <- as.Date(dates)
-  invalid_count <- sum(is.na(dates))
-  valid_dates <- sort(unique(dates[!is.na(dates)]))
-  if (length(valid_dates) < 2) {
-    warning("Not enough valid dates to compute gaps and streaks.")
-    return(list(span = NA, invalid = invalid_count, middle_date = NA,
-                avg_gap = NA, median_gap = NA,
-                longest_streak = NA, shortest_streak = NA,
-                max_gap = NA, min_gap = NA))
+mode_value <- function(
+    x,
+    return_type = c("string", "vector", "first", "count"),
+    na_rm = TRUE,
+    ties = c("all", "first"),
+    tie_break = c("first", "smallest", "largest"),
+    sep = ", ",
+    keep_class = TRUE
+) {
+  return_type <- match.arg(return_type)
+  ties <- match.arg(ties)
+  tie_break <- match.arg(tie_break)
+  
+  if (!(is.atomic(x) || is.factor(x))) .stopf("x must be an atomic vector or factor.")
+  
+  x2 <- if (na_rm) x[!is.na(x)] else x
+  
+  if (.is_empty(x2)) {
+    if (return_type == "count") return(0L)
+    if (return_type == "string") return(NA_character_)
+    return(.na_scalar(x))
   }
-  span <- as.numeric(max(valid_dates) - min(valid_dates))
-  middle_date <- min(valid_dates) + span / 2
-  gaps <- as.numeric(diff(valid_dates))
-  median_gap <- median(gaps)
-  # Calculate consecutive date streaks (where gap equals 1 day)
+  
+  u <- unique(x2)
+  idx <- match(x2, u)
+  counts <- tabulate(idx, nbins = length(u))
+  maxc <- max(counts)
+  modes <- u[counts == maxc]
+  
+  if (ties == "first" && length(modes) > 1L) {
+    if (tie_break == "first") {
+      modes <- modes[1L]
+    } else {
+      ok_order <- is.numeric(modes) || is.integer(modes) || inherits(modes, "Date")
+      if (ok_order) {
+        modes <- if (tie_break == "smallest") modes[which.min(modes)] else modes[which.max(modes)]
+      } else {
+        modes <- modes[1L]
+      }
+    }
+  }
+  
+  if (return_type == "count") return(as.integer(length(modes)))
+  if (return_type == "string") return(paste(as.character(modes), collapse = sep))
+  
+  if (!keep_class && is.factor(modes)) modes <- as.character(modes)
+  if (return_type == "vector") return(modes)
+  
+  modes[[1L]]
+}
+
+# -----------------------
+# Numeric conversion
+# -----------------------
+
+#' Convert to numeric
+#'
+#' Converts a vector to numeric (double). Factors are converted through character.
+#' Character values can be trimmed, specific strings can be treated as NA, and commas
+#' can be removed before parsing.
+#'
+#' @param x Vector to convert.
+#' @param na_values Character values treated as NA (after trimming).
+#' @param trim Trim whitespace for character inputs.
+#' @param remove_commas Remove "," before parsing.
+#' @param strict If TRUE and conversion yields all NA while input had non-NA, return all-NA.
+#'
+#' @return Numeric (double) vector.
+#' @export
+to_numeric <- function(
+    x,
+    na_values = c("", "NA", "N/A", "NULL", "null"),
+    trim = TRUE,
+    remove_commas = TRUE,
+    strict = TRUE
+) {
+  if (is.null(x)) return(numeric(0))
+  if (is.numeric(x)) return(as.numeric(x))
+  
+  n <- length(x)
+  nm <- names(x)
+  
+  if (is.factor(x)) x <- as.character(x)
+  
+  if (is.logical(x)) {
+    out <- as.numeric(x)
+    names(out) <- nm
+    return(out)
+  }
+  
+  if (is.character(x)) {
+    y <- x
+    if (trim) y <- trimws(y)
+    y[y %in% na_values] <- NA_character_
+    if (remove_commas) y <- gsub(",", "", y, fixed = TRUE)
+    
+    out <- suppressWarnings(as.numeric(y))
+    
+    if (strict) {
+      had_non_na <- any(!is.na(y))
+      if (had_non_na && all(is.na(out))) out <- rep(NA_real_, n)
+    }
+    
+    names(out) <- nm
+    return(out)
+  }
+  
+  out <- suppressWarnings(as.numeric(as.character(x)))
+  if (strict) {
+    had_non_na <- any(!is.na(x))
+    if (had_non_na && all(is.na(out))) out <- rep(NA_real_, n)
+  }
+  names(out) <- nm
+  out
+}
+
+# -----------------------
+# Date stats
+# -----------------------
+
+#' Date statistics
+#'
+#' Computes span between min/max dates, counts invalid entries, computes gap summaries,
+#' and identifies streaks of consecutive dates.
+#'
+#' @param dates Vector of Date/POSIXt/character.
+#' @param tz Timezone used for parsing character dates.
+#' @param try_formats Formats to try for parsing.
+#' @param unique_dates Use unique valid dates for gaps/streaks.
+#' @param middle_as "Date" or "character".
+#'
+#' @return A list with:
+#'   - span: numeric span in days
+#'   - invalid: count of NA after conversion
+#'   - invalid_input: count of NA in the original input
+#'   - n_valid: count of non-NA after conversion
+#'   - n_unique: count of unique valid dates used for gaps
+#'   - middle_date: midpoint date between min and max
+#'   - avg_gap, median_gap: gap summaries in days
+#'   - longest_streak, shortest_streak: streak lengths for consecutive dates
+#'   - max_gap, min_gap: largest/smallest gap in days
+#' @export
+date_stats <- function(
+    dates,
+    tz = "UTC",
+    try_formats = c(
+      "%Y-%m-%d", "%Y/%m/%d",
+      "%m/%d/%Y", "%d/%m/%Y",
+      "%m-%d-%Y", "%d-%m-%Y",
+      "%Y%m%d"
+    ),
+    unique_dates = TRUE,
+    middle_as = c("Date", "character")
+) {
+  middle_as <- match.arg(middle_as)
+  
+  if (is.null(dates)) .stopf("dates must not be NULL.")
+  if (!is.vector(dates)) .stopf("dates must be a vector.")
+  
+  invalid_input <- sum(is.na(dates))
+  d <- as_date_safe(dates, tz = tz, try_formats = try_formats)
+  invalid <- sum(is.na(d))
+  
+  valid <- d[!is.na(d)]
+  if (.is_empty(valid)) {
+    return(list(
+      span = NA_real_,
+      invalid = invalid,
+      invalid_input = invalid_input,
+      n_valid = 0L,
+      n_unique = 0L,
+      middle_date = if (middle_as == "Date") as.Date(NA) else NA_character_,
+      avg_gap = NA_real_,
+      median_gap = NA_real_,
+      longest_streak = NA_integer_,
+      shortest_streak = NA_integer_,
+      max_gap = NA_real_,
+      min_gap = NA_real_
+    ))
+  }
+  
+  if (unique_dates) valid <- unique(valid)
+  valid <- sort(valid)
+  
+  if (length(valid) == 1L) {
+    md <- valid[1L]
+    return(list(
+      span = 0,
+      invalid = invalid,
+      invalid_input = invalid_input,
+      n_valid = sum(!is.na(d)),
+      n_unique = length(valid),
+      middle_date = if (middle_as == "Date") md else as.character(md),
+      avg_gap = NA_real_,
+      median_gap = NA_real_,
+      longest_streak = 1L,
+      shortest_streak = 1L,
+      max_gap = NA_real_,
+      min_gap = NA_real_
+    ))
+  }
+  
+  span <- as.numeric(max(valid) - min(valid))
+  middle_date <- min(valid) + as.integer(round(span / 2))
+  
+  gaps <- as.numeric(diff(valid))
+  avg_gap <- mean(gaps)
+  median_gap <- stats::median(gaps)
+  max_gap <- max(gaps)
+  min_gap <- min(gaps)
+  
   r <- rle(gaps == 1)
   if (any(r$values)) {
-    longest_streak <- max(r$lengths[r$values]) + 1
-    shortest_streak <- min(r$lengths[r$values]) + 1
+    streaks <- r$lengths[r$values] + 1L
+    longest_streak <- max(streaks)
+    shortest_streak <- min(streaks)
   } else {
-    longest_streak <- NA
-    shortest_streak <- NA
+    longest_streak <- 1L
+    shortest_streak <- 1L
   }
+  
   list(
     span = span,
-    invalid = invalid_count,
-    middle_date = as.character(middle_date),
-    avg_gap = mean(gaps),
+    invalid = invalid,
+    invalid_input = invalid_input,
+    n_valid = sum(!is.na(d)),
+    n_unique = length(valid),
+    middle_date = if (middle_as == "Date") middle_date else as.character(middle_date),
+    avg_gap = avg_gap,
     median_gap = median_gap,
-    longest_streak = longest_streak,
-    shortest_streak = shortest_streak,
-    max_gap = max(gaps),
-    min_gap = min(gaps)
+    longest_streak = as.integer(longest_streak),
+    shortest_streak = as.integer(shortest_streak),
+    max_gap = max_gap,
+    min_gap = min_gap
   )
 }
 
-# --- Get Statistics for a Factor Variable ---
-#' Get Statistics for a Factor Variable
+# -----------------------
+# Factor stats
+# -----------------------
+
+#' Factor statistics
 #'
-#' This function returns a list of statistics for a factor variable including the number of levels,
-#' a formatted string of observation counts per level, the percentage of observations per level,
-#' and the mode (using \code{calculate_mode()}).
+#' Computes level count, observation counts and percentages, and the mode.
 #'
-#' @param factor_col A factor vector. Must not be \code{NULL}.
+#' @param x Factor (or coercible to factor when strict=FALSE).
+#' @param strict If TRUE, require factor input.
+#' @param include_na Include NA counts.
 #'
-#' @return A list with the following elements:
-#'   \item{levels_count}{Number of levels in the factor.}
-#'   \item{obs_count}{A string summarizing the count of observations per level.}
-#'   \item{obs_perc}{A string representing the percentage of observations per level.}
-#'   \item{mode}{The mode of the factor as computed by \code{calculate_mode()}.}
-#'
+#' @return A list with:
+#'   - levels_count
+#'   - obs_count
+#'   - obs_perc
+#'   - mode
 #' @export
-get_factor_stats <- function(factor_col) {
-  assertthat::assert_that(!is.null(factor_col), msg = "factor_col must not be NULL")
-  if (!is.factor(factor_col)) stop("Input must be a factor vector.")
-  obs_count <- table(factor_col, useNA = "ifany")
+factor_stats <- function(x, strict = TRUE, include_na = TRUE) {
+  if (is.null(x)) .stopf("Input must not be NULL.")
+  
+  if (!is.factor(x)) {
+    if (strict) .stopf("Input must be a factor when strict=TRUE.")
+    x <- as.factor(x)
+  }
+  
+  tab <- table(x, useNA = if (include_na) "ifany" else "no")
+  perc <- round(100 * prop.table(tab), 2)
+  
   list(
-    levels_count = length(levels(factor_col)),
-    obs_count = paste(names(obs_count), obs_count, sep = ": ", collapse = "; "),
-    obs_perc = paste(round(100 * prop.table(obs_count), 2), collapse = ", "),
-    mode = calculate_mode(factor_col)
+    levels_count = length(levels(x)),
+    obs_count = paste(names(tab), as.integer(tab), sep = ": ", collapse = "; "),
+    obs_perc = paste(as.numeric(perc), collapse = ", "),
+    mode = mode_value(x, return_type = "string")
   )
 }
 
-# --- Compute Geographic Statistics from Coordinate Data ---
-#' Compute Geographic Statistics from Coordinate Data
+# -----------------------
+# GIS stats
+# -----------------------
+
+#' GIS statistics from lon/lat
 #'
-#' This function calculates various geographic statistics from a data frame containing coordinates.
-#' The statistics include the centroid of all points, a distance matrix between points, the nearest neighboring point
-#' for each coordinate, the convex hull, and the greatest distance among points. Coordinates can be transformed
-#' into a projected CRS if desired.
+#' Creates an sf point object from lon/lat columns, computes centroid and convex hull,
+#' and optionally computes a pairwise distance matrix and nearest-neighbor indices.
 #'
-#' @param coords_df A data frame containing coordinate columns.
-#' @param lon_var A character string indicating the column name for longitude (case-insensitive). Default is \code{"longitude"}.
-#' @param lat_var A character string indicating the column name for latitude (case-insensitive). Default is \code{"latitude"}.
-#' @param use_projected Logical. If \code{TRUE}, the points are transformed into the projected CRS specified by \code{output_crs}. Default is \code{TRUE}.
-#' @param input_crs An integer specifying the input Coordinate Reference System (CRS) (e.g., 4326 for WGS84). Default is 4326.
-#' @param output_crs An integer specifying the output (projected) CRS (e.g., 3857 for Web Mercator). Default is 3857.
+#' @param coords data.frame with lon/lat columns.
+#' @param lon Name of longitude column (case-insensitive).
+#' @param lat Name of latitude column (case-insensitive).
+#' @param input_crs EPSG of input CRS.
+#' @param output_crs EPSG of output CRS used when projected=TRUE.
+#' @param projected If TRUE, transforms points to output_crs.
+#' @param distance_matrix If TRUE, computes a full pairwise distance matrix.
+#' @param nearest If TRUE, computes nearest-neighbor index per point.
+#' @param max_n_matrix Maximum number of points for distance matrix computations.
+#' @param drop_units If TRUE, drops units from distance outputs when the units package is available.
 #'
-#' @return A list containing:
-#'   \item{centroid}{An \code{sf} object representing the centroid of the union of all points.}
-#'   \item{distance_matrix}{A matrix of distances between each pair of points.}
-#'   \item{nearest_points}{A list where each element is an \code{sf} object representing the nearest point for the corresponding input point.}
-#'   \item{convex_hull}{An \code{sf} object representing the convex hull around the points.}
-#'   \item{greatest_distance}{The maximum distance found among the points.}
-#'
+#' @return A list with:
+#'   - centroid: sf geometry for centroid
+#'   - convex_hull: sf geometry for convex hull
+#'   - distance_matrix: matrix of distances (optional)
+#'   - nearest_index: integer vector of nearest indices (optional)
+#'   - greatest_distance: maximum distance observed
+#'   - n_points: number of points used
 #' @export
-get_gis_stats <- function(coords_df, lon_var = "longitude", lat_var = "latitude",
-                          use_projected = TRUE, input_crs = 4326, output_crs = 3857) {
-  assertthat::assert_that(is.data.frame(coords_df), msg = "coords_df must be a data frame")
-  cols_lower <- tolower(names(coords_df))
-  assertthat::assert_that(lon_var %in% cols_lower, lat_var %in% cols_lower,
-                          msg = "Coordinates data frame must contain columns for longitude and latitude")
-  lon_name <- names(coords_df)[which(tolower(names(coords_df)) == lon_var)][1]
-  lat_name <- names(coords_df)[which(tolower(names(coords_df)) == lat_var)][1]
+gis_stats <- function(
+    coords,
+    lon = "longitude",
+    lat = "latitude",
+    input_crs = 4326,
+    output_crs = 3857,
+    projected = TRUE,
+    distance_matrix = FALSE,
+    nearest = FALSE,
+    max_n_matrix = 5000L,
+    drop_units = TRUE
+) {
+  .require_pkg("sf")
   
-  sf_points <- sf::st_as_sf(coords_df, coords = c(lon_name, lat_name), crs = input_crs, remove = FALSE)
-  if (use_projected) sf_points <- sf::st_transform(sf_points, crs = output_crs)
+  if (!is.data.frame(coords)) .stopf("coords must be a data.frame.")
   
-  centroid <- sf::st_centroid(sf::st_union(sf_points))
-  distance_matrix <- sf::st_distance(sf_points)
-  nearest_points <- lapply(1:nrow(sf_points), function(i) {
-    d <- as.numeric(sf::st_distance(sf_points[i, ], sf_points))
-    d[i] <- Inf
-    nearest_index <- which.min(d)
-    sf::st_nearest_points(sf_points[i, ], sf_points[nearest_index, ])
-  })
-  convex_hull <- sf::st_convex_hull(sf::st_union(sf_points))
-  greatest_distance <- max(distance_matrix)
+  cols_lower <- tolower(names(coords))
+  if (!(tolower(lon) %in% cols_lower && tolower(lat) %in% cols_lower)) {
+    .stopf("coords must contain lon/lat columns (case-insensitive).")
+  }
+  
+  lon_name <- names(coords)[match(tolower(lon), cols_lower)]
+  lat_name <- names(coords)[match(tolower(lat), cols_lower)]
+  
+  ok <- !(is.na(coords[[lon_name]]) | is.na(coords[[lat_name]]))
+  df_ok <- coords[ok, , drop = FALSE]
+  
+  if (nrow(df_ok) == 0L) {
+    return(list(
+      centroid = NA,
+      convex_hull = NA,
+      distance_matrix = NULL,
+      nearest_index = NULL,
+      greatest_distance = NA,
+      n_points = 0L
+    ))
+  }
+  
+  pts <- sf::st_as_sf(df_ok, coords = c(lon_name, lat_name), crs = input_crs, remove = FALSE)
+  if (projected) pts <- sf::st_transform(pts, crs = output_crs)
+  
+  n <- nrow(pts)
+  
+  centroid <- sf::st_centroid(sf::st_union(pts))
+  hull <- sf::st_convex_hull(sf::st_union(pts))
+  
+  hull_xy <- sf::st_coordinates(hull)
+  hull_xy <- unique(hull_xy[, c("X", "Y"), drop = FALSE])
+  hull_pts <- sf::st_as_sf(
+    data.frame(X = hull_xy[, 1], Y = hull_xy[, 2]),
+    coords = c("X", "Y"),
+    crs = sf::st_crs(pts)
+  )
+  greatest_distance <- if (nrow(hull_pts) >= 2L) max(sf::st_distance(hull_pts)) else NA
+  
+  dm <- NULL
+  nearest_index <- NULL
+  
+  if (nearest) distance_matrix <- TRUE
+  
+  if (distance_matrix) {
+    if (n > max_n_matrix) {
+      warning(sprintf("n=%d exceeds max_n_matrix=%d; skipping distance computations.", n, max_n_matrix))
+    } else {
+      dm <- sf::st_distance(pts)
+      greatest_distance <- max(dm)
+      
+      if (nearest) {
+        m <- as.matrix(dm)
+        dnum <- as.numeric(m)
+        dim(dnum) <- dim(m)
+        diag(dnum) <- Inf
+        nearest_index <- apply(dnum, 1L, which.min)
+      }
+    }
+  }
+  
+  if (drop_units && requireNamespace("units", quietly = TRUE)) {
+    if (!is.null(dm)) dm <- units::drop_units(dm)
+    if (!is.na(greatest_distance)[1]) greatest_distance <- units::drop_units(greatest_distance)
+  }
   
   list(
     centroid = centroid,
-    distance_matrix = distance_matrix,
-    nearest_points = nearest_points,
-    convex_hull = convex_hull,
-    greatest_distance = greatest_distance
+    convex_hull = hull,
+    distance_matrix = dm,
+    nearest_index = nearest_index,
+    greatest_distance = greatest_distance,
+    n_points = n
   )
 }
 
-# --- Compute Multiple Column Statistics for a Data Frame ---
-#' Compute Multiple Column Statistics for a Data Frame
+# -----------------------
+# Quick per-column stats
+# -----------------------
+
+#' Column statistics for a data frame
 #'
-#' This function computes various statistics for each column in a data frame.
-#' For numeric columns: it returns null count, percentage of non-null values, unique level count,
-#' and highest/lowest values. For character columns: it computes null count, unique count, and statistics on string lengths.
-#' Factor columns are handled via \code{get_factor_stats()}.
+#' Computes null counts, unique counts, and basic range/length summaries per column.
 #'
-#' @param data A data frame for which the column statistics will be computed.
-#'
-#' @return A \code{data.table} object containing a row per column with computed statistics.
-#'
+#' @param data data.frame
+#' @return data.table with one row per column
 #' @export
-get_multi_stats <- function(data) {
-  assertthat::assert_that(is.data.frame(data), msg = "data must be a data frame")
+col_stats <- function(data) {
+  .require_pkg("data.table")
+  if (!is.data.frame(data)) .stopf("data must be a data.frame.")
+  
   dt <- data.table::as.data.table(data)
-  stats_list <- lapply(names(dt), function(col) {
+  n_rows <- nrow(dt)
+  
+  out <- lapply(names(dt), function(col) {
     x <- dt[[col]]
+    nulls <- sum(is.na(x))
+    pct_non_null <- round(100 * .safe_div(n_rows - nulls, n_rows), 2)
+    uniq <- data.table::uniqueN(x, na.rm = FALSE)
+    
+    type <- if (inherits(x, "Date") || inherits(x, "POSIXt")) "date" else
+      if (is.numeric(x)) "numeric" else
+        if (is.factor(x)) "factor" else
+          if (is.character(x)) "character" else class(x)[1L]
+    
+    highest <- NA_character_
+    lowest <- NA_character_
+    if (is.numeric(x) || inherits(x, "Date")) {
+      highest <- as.character(.safe_max(x))
+      lowest  <- as.character(.safe_min(x))
+    } else if (is.character(x)) {
+      xx <- x[!is.na(x)]
+      if (!.is_empty(xx)) {
+        highest <- max(xx)
+        lowest  <- min(xx)
+      }
+    }
+    
+    avg_len <- max_len <- min_len <- NA_real_
+    if (is.character(x)) {
+      nx <- nchar(x)
+      avg_len <- .safe_mean(nx)
+      max_len <- .safe_max(nx)
+      min_len <- .safe_min(nx)
+    }
+    
     data.table::data.table(
       column = col,
-      nulls = sum(is.na(x)),
-      pct_non_null = round(100 * (length(x) - sum(is.na(x))) / length(x), 2),
-      unique_levels = length(unique(x)),
-      highest_value = if (is.numeric(x) || is.character(x)) as.character(max(x, na.rm = TRUE)) else NA_character_,
-      lowest_value = if (is.numeric(x) || is.character(x)) as.character(min(x, na.rm = TRUE)) else NA_character_,
-      avg_length = if (is.character(x)) mean(nchar(x), na.rm = TRUE) else NA_real_,
-      max_length = if (is.character(x)) max(nchar(x), na.rm = TRUE) else NA_real_,
-      min_length = if (is.character(x)) min(nchar(x), na.rm = TRUE) else NA_real_
+      type = type,
+      n = n_rows,
+      nulls = nulls,
+      pct_non_null = pct_non_null,
+      unique_levels = uniq,
+      highest_value = highest,
+      lowest_value = lowest,
+      avg_length = avg_len,
+      max_length = max_len,
+      min_length = min_len
     )
   })
-  data.table::rbindlist(stats_list, use.names = TRUE, fill = TRUE)
+  
+  data.table::rbindlist(out, use.names = TRUE, fill = TRUE)
 }
 
-# --- Compute Descriptive Statistics for a Numeric Vector ---
-#' Compute Descriptive Statistics for a Numeric Vector
+# -----------------------
+# Numeric stats
+# -----------------------
+
+#' Numeric descriptive statistics
 #'
-#' This function calculates descriptive statistics for a numeric vector including mean, median,
-#' mode, sample and population standard deviation, kurtosis, skewness, sum, and absolute sum.
-#' In addition, it returns the minimum, maximum, first and third quartiles, interquartile range (IQR),
-#' and the median absolute deviation (MAD). If the input vector contains only NA values, all returned statistics will be NA.
+#' Computes common descriptive statistics from a numeric vector, including
+#' mean, median, standard deviation, quantiles, and sums. Skewness and kurtosis
+#' are included when the moments package is available and moments=TRUE.
 #'
-#' @param num_vec A numeric vector. NA values are ignored.
+#' @param x Numeric vector (or coercible when coerce=TRUE).
+#' @param coerce Convert input to numeric using to_numeric().
+#' @param moments Compute skewness/kurtosis when moments is available.
 #'
-#' @return A named numeric vector containing the following statistics:
-#'   \itemize{
-#'     \item \code{Mean}
-#'     \item \code{Median}
-#'     \item \code{Mode} (first mode if multiple exist)
-#'     \item \code{Sample_SD}
-#'     \item \code{Pop_SD}
-#'     \item \code{Kurtosis}
-#'     \item \code{Skewness}
-#'     \item \code{Sum}
-#'     \item \code{Abs_Sum}
-#'     \item \code{Min}
-#'     \item \code{Max}
-#'     \item \code{Q1} (25th percentile)
-#'     \item \code{Q3} (75th percentile)
-#'     \item \code{IQR} (interquartile range)
-#'     \item \code{MAD} (median absolute deviation)
-#'   }
-#'
+#' @return Named numeric vector.
 #' @export
-get_numeric_stats <- function(num_vec) {
-  if (DEBUG) {
-    flog.info("get_numeric_stats: Received vector (head): %s", paste(utils::head(num_vec), collapse = ", "))
-    flush.console()
-    flog.debug("get_numeric_stats: Structure:")
-    str(num_vec)
-    flush.console()
+num_stats <- function(x, coerce = FALSE, moments = TRUE) {
+  if (coerce && !is.numeric(x)) x <- to_numeric(x)
+  if (!is.numeric(x)) .stopf("x must be numeric (or set coerce=TRUE).")
+  
+  v <- x[!is.na(x)]
+  if (.is_empty(v)) {
+    return(c(
+      Mean = NA_real_, Median = NA_real_, Mode = NA_real_,
+      Sample_SD = NA_real_, Pop_SD = NA_real_,
+      Kurtosis = NA_real_, Skewness = NA_real_,
+      Sum = NA_real_, Abs_Sum = NA_real_,
+      Min = NA_real_, Max = NA_real_,
+      Q1 = NA_real_, Q3 = NA_real_,
+      IQR = NA_real_, MAD = NA_real_,
+      N = 0
+    ))
   }
-  assertthat::assert_that(is.numeric(num_vec), msg = "num_vec must be numeric")
-  if (all(is.na(num_vec))) {
-    return(c(Mean = NA, Median = NA, Mode = NA, Sample_SD = NA,
-             Pop_SD = NA, Kurtosis = NA, Skewness = NA, Sum = NA, Abs_Sum = NA,
-             Min = NA, Max = NA, Q1 = NA, Q3 = NA, IQR = NA, MAD = NA))
+  
+  n <- length(v)
+  mode1 <- mode_value(v, return_type = "first", ties = "first", tie_break = "first")
+  
+  sample_sd <- if (n >= 2L) stats::sd(v) else NA_real_
+  pop_sd <- if (n >= 2L) sample_sd * sqrt((n - 1) / n) else NA_real_
+  
+  kurt <- skew <- NA_real_
+  if (moments && requireNamespace("moments", quietly = TRUE)) {
+    kurt <- tryCatch(moments::kurtosis(v), error = function(e) NA_real_)
+    skew <- tryCatch(moments::skewness(v), error = function(e) NA_real_)
   }
-  n_non_na <- sum(!is.na(num_vec))
-  mode_val <- calculate_mode(num_vec)
+  
+  q1 <- as.numeric(stats::quantile(v, 0.25, names = FALSE, type = 7))
+  q3 <- as.numeric(stats::quantile(v, 0.75, names = FALSE, type = 7))
+  
   c(
-    Mean = mean(num_vec, na.rm = TRUE),
-    Median = median(num_vec, na.rm = TRUE),
-    Mode = as.numeric(as.character(mode_val)),
-    Sample_SD = sd(num_vec, na.rm = TRUE),
-    Pop_SD = sd(num_vec, na.rm = TRUE) * sqrt((n_non_na - 1) / n_non_na),
-    Kurtosis = moments::kurtosis(num_vec, na.rm = TRUE),
-    Skewness = moments::skewness(num_vec, na.rm = TRUE),
-    Sum = sum(num_vec, na.rm = TRUE),
-    Abs_Sum = sum(abs(num_vec), na.rm = TRUE),
-    Min = min(num_vec, na.rm = TRUE),
-    Max = max(num_vec, na.rm = TRUE),
-    Q1 = as.numeric(quantile(num_vec, 0.25, na.rm = TRUE, names = FALSE)),
-    Q3 = as.numeric(quantile(num_vec, 0.75, na.rm = TRUE, names = FALSE)),
-    IQR = IQR(num_vec, na.rm = TRUE),
-    MAD = mad(num_vec, na.rm = TRUE)
+    Mean = mean(v),
+    Median = stats::median(v),
+    Mode = as.numeric(mode1),
+    Sample_SD = sample_sd,
+    Pop_SD = pop_sd,
+    Kurtosis = kurt,
+    Skewness = skew,
+    Sum = sum(v),
+    Abs_Sum = sum(abs(v)),
+    Min = min(v),
+    Max = max(v),
+    Q1 = q1,
+    Q3 = q3,
+    IQR = stats::IQR(v),
+    MAD = stats::mad(v),
+    N = n
   )
 }
 
-# --- Compute Statistics for All Columns in One or More Data Frames ---
-#' Compute Statistics for All Columns in One or More Data Frames
+# -----------------------
+# All stats
+# -----------------------
+
+#' Statistics for all columns in one or more data frames
 #'
-#' This function computes statistics for each column in a data frame or a list of data frames.
-#' It first determines or applies a user-specified mapping for each column type (e.g., numeric, factor,
-#' date, character, or other). Based on this mapping, it calls helper functions (\code{get_numeric_stats()},
-#' \code{get_factor_stats()}, \code{get_date_stats()}, etc.) to compute the appropriate statistics.
+#' Computes per-column statistics grouped by inferred or user-provided column type.
+#' Results are returned per data frame with separate tables for numeric, factor,
+#' date, character, and other columns.
 #'
-#' @param dfs Either a single data frame or a named list of data frames.
-#' @param col_types An optional named list that provides manual type mappings for columns in each data frame.
-#'   If provided, the mapping should be a named character vector where the names correspond to column names
-#'   and the values are one of \code{"numeric"}, \code{"factor"}, \code{"date"}, or \code{"character"}.
+#' @param dfs data.frame or named list of data.frames
+#' @param types Optional:
+#'   - for a single data.frame: named character vector of column types
+#'   - for a list of data.frames: named list of named character vectors
+#'   Values in: c("numeric","factor","date","character","other","skip")
+#' @param coerce_numeric Convert numeric-mapped columns using to_numeric().
+#' @param moments Compute skewness/kurtosis when available.
 #'
-#' @return A named list where each element corresponds to a data frame and contains a list with components:
-#'   \itemize{
-#'     \item \code{Numeric}: Statistics for numeric columns.
-#'     \item \code{Factor}: Statistics for factor columns.
-#'     \item \code{Date}: Statistics for date columns.
-#'     \item \code{Character}: Statistics for character columns.
-#'     \item \code{Other}: Statistics for columns that do not fall into the above categories.
-#'   }
-#'
+#' @return Named list of results per data frame.
 #' @export
-get_all_stats <- function(dfs, col_types = NULL) {
+all_stats <- function(dfs, types = NULL, coerce_numeric = TRUE, moments = TRUE) {
+  .require_pkg("data.table")
+  
+  allowed <- c("numeric", "factor", "date", "character", "other", "skip")
+  
   if (inherits(dfs, "data.frame")) {
     df_name <- deparse(substitute(dfs))
-    original_df <- dfs
-    dfs <- list()
-    dfs[[df_name]] <- original_df
+    dfs <- setNames(list(dfs), df_name)
   }
-  result <- lapply(names(dfs), function(df_name) {
-    flog.info("Processing data frame: %s", df_name)
-    flush.console()
+  
+  if (!is.list(dfs) || .is_empty(dfs)) .stopf("dfs must be a data.frame or a non-empty list of data.frames.")
+  if (is.null(names(dfs)) || any(names(dfs) == "")) .stopf("dfs must be a named list (or a single data.frame).")
+  
+  if (!is.null(types) && is.character(types) && !is.list(types)) {
+    types <- setNames(list(types), names(dfs)[1])
+  }
+  
+  res <- lapply(names(dfs), function(df_name) {
     df <- dfs[[df_name]]
-    if (!is.null(col_types) && !is.null(col_types[[df_name]])) {
-      mapping_manual <- col_types[[df_name]]
-      flog.info("Manual mapping for %s: %s", df_name,
-                paste(names(mapping_manual), mapping_manual, sep = "=", collapse = ", "))
-      flush.console()
-      for (col in names(mapping_manual)) {
-        if (col %in% names(df)) {
-          target_type <- mapping_manual[[col]]
-          flog.info("Processing column %s with target type %s", col, target_type)
-          flog.info("Before conversion, head: %s", paste(utils::head(df[[col]]), collapse = ", "))
-          flog.debug("Structure:")
-          str(df[[col]])
-          flush.console()
-          if (target_type == "numeric") {
-            conv <- safe_numeric(df[[col]])
-            if (!is.numeric(conv) || (all(is.na(conv)) && !all(is.na(df[[col]])))) {
-              flog.error("Column %s failed conversion to numeric; skipping.", col)
-              flush.console()
-              mapping_manual[[col]] <- "skip"
-            } else {
-              df[[col]] <- conv
-            }
-          } else if (target_type == "factor") {
-            df[[col]] <- as.factor(df[[col]])
-          } else if (target_type == "date") {
-            df[[col]] <- tryCatch(as.Date(df[[col]]), error = function(e) NA)
-          } else if (target_type == "character") {
-            df[[col]] <- as.character(df[[col]])
-          }
-          flog.info("After conversion, head of %s: %s", col, paste(utils::head(df[[col]]), collapse = ", "))
-          flog.debug("Structure:")
-          str(df[[col]])
-          flush.console()
-        }
+    if (!is.data.frame(df)) .stopf("Element '%s' is not a data.frame.", df_name)
+    
+    mapping <- NULL
+    
+    if (!is.null(types) && !is.null(types[[df_name]])) {
+      m <- types[[df_name]]
+      if (is.null(names(m))) .stopf("types[['%s']] must be a named character vector.", df_name)
+      
+      bad <- setdiff(unique(unname(m)), allowed)
+      if (length(bad) > 0L) .stopf("Invalid types for '%s': %s", df_name, paste(bad, collapse = ", "))
+      
+      for (col in intersect(names(m), names(df))) {
+        target <- m[[col]]
+        if (target == "skip") next
+        if (target == "numeric" && coerce_numeric) df[[col]] <- to_numeric(df[[col]])
+        if (target == "factor") df[[col]] <- as.factor(df[[col]])
+        if (target == "character") df[[col]] <- as.character(df[[col]])
+        if (target == "date") df[[col]] <- as_date_safe(df[[col]])
       }
-      mapping <- mapping_manual[mapping_manual != "skip"]
-    } else {
-      mapping <- sapply(df, function(x) {
+      
+      mapping <- m[m != "skip"]
+      mapping <- mapping[names(mapping) %in% names(df)]
+    }
+    
+    if (is.null(mapping)) {
+      mapping <- vapply(df, function(x) {
         if (inherits(x, "Date") || inherits(x, "POSIXt")) "date" else
           if (is.numeric(x)) "numeric" else
             if (is.factor(x)) "factor" else
               if (is.character(x)) "character" else "other"
-      })
-      flog.info("Inferred mapping for %s: %s", df_name,
-                paste(names(mapping), mapping, sep = "=", collapse = ", "))
-      flush.console()
+      }, character(1))
     }
-    numeric_cols <- names(mapping)[mapping == "numeric"]
-    factor_cols  <- names(mapping)[mapping == "factor"]
-    date_cols    <- names(mapping)[mapping == "date"]
-    char_cols    <- names(mapping)[mapping == "character"]
-    other_cols   <- names(mapping)[mapping == "other"]
-    numeric_stats <- if (length(numeric_cols) > 0) {
-      ns_list <- lapply(numeric_cols, function(col) {
-        stats <- get_numeric_stats(df[[col]])
-        data.table::as.data.table(cbind(Column = col, t(as.data.frame(stats))))
-      })
-      data.table::rbindlist(ns_list, use.names = TRUE, fill = TRUE)
-    } else NULL
-    factor_stats <- if (length(factor_cols) > 0) {
-      fs_list <- lapply(factor_cols, function(col) {
-        stats <- get_factor_stats(df[[col]])
-        dt <- data.table::as.data.table(as.list(sapply(stats, as.character)))
+    
+    num_cols <- names(mapping)[mapping == "numeric"]
+    fac_cols <- names(mapping)[mapping == "factor"]
+    dat_cols <- names(mapping)[mapping == "date"]
+    chr_cols <- names(mapping)[mapping == "character"]
+    oth_cols <- names(mapping)[mapping == "other"]
+    
+    num_out <- if (length(num_cols) > 0L) {
+      lst <- lapply(num_cols, function(col) {
+        st <- num_stats(df[[col]], coerce = FALSE, moments = moments)
+        dt <- data.table::as.data.table(as.list(st))
         dt[, Column := col]
         dt[, c("Column", setdiff(names(dt), "Column")), with = FALSE]
       })
-      data.table::rbindlist(fs_list, use.names = TRUE, fill = TRUE)
+      data.table::rbindlist(lst, use.names = TRUE, fill = TRUE)
     } else NULL
-    date_stats <- if (length(date_cols) > 0) {
-      ds_list <- lapply(date_cols, function(col) {
-        stats <- get_date_stats(df[[col]])
-        dt <- data.table::as.data.table(as.list(sapply(stats, as.character)))
+    
+    fac_out <- if (length(fac_cols) > 0L) {
+      lst <- lapply(fac_cols, function(col) {
+        st <- factor_stats(df[[col]], strict = FALSE)
+        dt <- data.table::as.data.table(st)
         dt[, Column := col]
         dt[, c("Column", setdiff(names(dt), "Column")), with = FALSE]
       })
-      data.table::rbindlist(ds_list, use.names = TRUE, fill = TRUE)
+      data.table::rbindlist(lst, use.names = TRUE, fill = TRUE)
     } else NULL
-    char_stats <- if (length(char_cols) > 0) {
-      cs_list <- lapply(char_cols, function(col) {
+    
+    dat_out <- if (length(dat_cols) > 0L) {
+      lst <- lapply(dat_cols, function(col) {
+        st <- date_stats(df[[col]], middle_as = "character")
+        dt <- data.table::as.data.table(st)
+        dt[, Column := col]
+        dt[, c("Column", setdiff(names(dt), "Column")), with = FALSE]
+      })
+      data.table::rbindlist(lst, use.names = TRUE, fill = TRUE)
+    } else NULL
+    
+    chr_out <- if (length(chr_cols) > 0L) {
+      lst <- lapply(chr_cols, function(col) {
         x <- as.character(df[[col]])
+        nx <- nchar(x)
         data.table::data.table(
           Column = col,
           Nulls = sum(is.na(x)),
-          Unique = length(unique(x)),
-          Avg_Length = mean(nchar(x), na.rm = TRUE),
-          Max_Length = max(nchar(x), na.rm = TRUE),
-          Min_Length = min(nchar(x), na.rm = TRUE)
+          Unique = data.table::uniqueN(x, na.rm = FALSE),
+          Avg_Length = .safe_mean(nx),
+          Max_Length = .safe_max(nx),
+          Min_Length = .safe_min(nx)
         )
       })
-      data.table::rbindlist(cs_list, use.names = TRUE, fill = TRUE)
+      data.table::rbindlist(lst, use.names = TRUE, fill = TRUE)
     } else NULL
-    other_stats <- if (length(other_cols) > 0) {
-      os_list <- lapply(other_cols, function(col) {
+    
+    oth_out <- if (length(oth_cols) > 0L) {
+      lst <- lapply(oth_cols, function(col) {
         x <- df[[col]]
         data.table::data.table(
           Column = col,
           Nulls = sum(is.na(x)),
-          Unique = length(unique(x))
+          Unique = data.table::uniqueN(x, na.rm = FALSE),
+          Class = paste(class(x), collapse = "|")
         )
       })
-      data.table::rbindlist(os_list, use.names = TRUE, fill = TRUE)
+      data.table::rbindlist(lst, use.names = TRUE, fill = TRUE)
     } else NULL
+    
     list(
-      Numeric = numeric_stats,
-      Factor = factor_stats,
-      Date = date_stats,
-      Character = char_stats,
-      Other = other_stats
+      Numeric = num_out,
+      Factor = fac_out,
+      Date = dat_out,
+      Character = chr_out,
+      Other = oth_out
     )
   })
-  names(result) <- names(dfs)
-  return(result)
+  
+  names(res) <- names(dfs)
+  res
 }
 
-# --- Compute Group-Based Statistics for a Data Frame ---
-#' Compute Group-Based Statistics for a Data Frame
+# -----------------------
+# Group stats
+# -----------------------
+
+#' Grouped statistics for a data frame
 #'
-#' This function computes statistics for a data frame grouped by a specified column.
-#' For each group, detailed debug information is logged at each processing step:
-#' the input is converted to a data.table, rows are subset using indices obtained via \code{which()},
-#' the subset is converted to a data frame, the grouping column is removed,
-#' and finally \code{get_all_stats()} is called on the resulting subset to compute statistics.
+#' Splits a data frame by a grouping column and computes statistics per group.
+#' The grouping column is excluded from group-level computations.
 #'
-#' @param data A data frame containing the data.
-#' @param group A character string specifying the name of the column to group by.
+#' @param data data.frame
+#' @param group Column name to group by
+#' @param na_label Label used for NA group in output names
+#' @param ... Passed to all_stats()
 #'
-#' @return A named list where each element corresponds to a group from the \code{group} column,
-#' and the value is the output of \code{get_all_stats()} for that subgroup.
-#'
-#' @details Detailed debug logging is performed using \code{futile.logger} to facilitate troubleshooting.
-#'
+#' @return Named list of group -> stats
 #' @export
-get_group_stats <- function(data, group) {
-  # Validate input
-  assertthat::assert_that(is.data.frame(data), msg = "data must be a data frame")
-  assertthat::assert_that(group %in% names(data), msg = "group column must be present in data")
+group_stats <- function(data, group, na_label = "NA", ...) {
+  .require_pkg("data.table")
   
-  futile.logger::flog.info("Converting input data to data.table.")
+  if (!is.data.frame(data)) .stopf("data must be a data.frame.")
+  if (!is.character(group) || length(group) != 1L) .stopf("group must be a single column name.")
+  if (!(group %in% names(data))) .stopf("group column '%s' not present in data.", group)
+  
   dt <- data.table::as.data.table(data)
-  futile.logger::flog.info("Data.table conversion complete. Number of rows: %s", nrow(dt))
+  g <- dt[[group]]
   
-  # Get unique groups and log them
-  groups <- unique(dt[[group]])
-  futile.logger::flog.info("Unique groups in column '%s': %s", group, paste(groups, collapse = ", "))
+  key <- as.character(g)
+  key[is.na(g)] <- na_label
   
-  # Process each group using which() for subsetting
-  group_stats <- lapply(groups, function(g) {
-    futile.logger::flog.info("Processing group: %s", g)
-    
-    # Extract the grouping column as a vector to avoid indexing issues
-    group_col <- dt[[group]]
-    futile.logger::flog.debug("Group column vector: %s", paste(group_col, collapse = ", "))
-    
-    # Determine the indices for the current group (handle NA groups explicitly)
-    if (is.na(g)) {
-      futile.logger::flog.info("Group is NA. Subsetting rows where '%s' is NA.", group)
-      subset_indices <- which(is.na(group_col))
-    } else {
-      futile.logger::flog.info("Subsetting rows where '%s' equals %s.", group, g)
-      subset_indices <- which(group_col == g)
-    }
-    futile.logger::flog.info("Subset indices for group %s: %s", g, paste(subset_indices, collapse = ", "))
-    
-    # Subset dt using the indices
-    subset_dt <- dt[subset_indices]
-    futile.logger::flog.info("Subset data.table for group %s has %s rows.", g, nrow(subset_dt))
-    futile.logger::flog.debug("Structure of subset data.table for group %s:", g)
-    str(subset_dt)
-    
-    # Convert the subset to a data.frame for easier column removal
-    futile.logger::flog.info("Converting subset data.table for group %s to data.frame.", g)
-    subset_df <- as.data.frame(subset_dt)
-    futile.logger::flog.info("Data.frame conversion complete. Dimensions: %s x %s", 
-                             nrow(subset_df), ncol(subset_df))
-    
-    # Remove the grouping column using base R subsetting
-    futile.logger::flog.info("Removing grouping column '%s' from subset.", group)
-    subset_df <- subset_df[, setdiff(names(subset_df), group), drop = FALSE]
-    futile.logger::flog.info("After removal, dimensions: %s x %s", nrow(subset_df), ncol(subset_df))
-    futile.logger::flog.debug("Final subset data.frame for group %s:", g)
-    str(subset_df)
-    
-    # Compute statistics for the subset using get_all_stats()
-    futile.logger::flog.info("Computing stats for group %s using get_all_stats().", g)
-    stats <- get_all_stats(subset_df)
-    futile.logger::flog.info("Stats computed for group %s.", g)
-    
-    return(stats)
+  idx <- split(seq_len(nrow(dt)), key)
+  
+  out <- lapply(names(idx), function(k) {
+    sub_dt <- dt[idx[[k]], , drop = FALSE]
+    sub_dt[, (group) := NULL]
+    all_stats(as.data.frame(sub_dt), ...)
   })
   
-  names(group_stats) <- as.character(groups)
-  futile.logger::flog.info("Group stats computation complete for groups: %s", 
-                           paste(names(group_stats), collapse = ", "))
-  return(group_stats)
+  names(out) <- names(idx)
+  out
 }
 
-# --- Helper Function for UAT Output ---
-#' Print UAT (User Acceptance Testing) Output
+# -----------------------
+# Wrapper
+# -----------------------
+
+#' Get common stats in one call
 #'
-#' This helper function prints formatted output for UAT tests.
+#' Returns a combined result containing optional column summaries, full per-type
+#' statistics, and optional grouped statistics.
 #'
-#' @param test_name A character string specifying the test name.
-#' @param result A character string representing the result of the test.
-#' @param expected An optional character string describing the expected result.
-#' @param note An optional note to provide additional information.
+#' @param data data.frame
+#' @param group Optional grouping column name.
+#' @param types Optional mapping passed to all_stats().
+#' @param quick If TRUE, include col_stats().
+#' @param moments If TRUE, compute skewness/kurtosis when available.
+#' @param coerce_numeric If TRUE, coerce numeric-mapped columns via to_numeric().
+#'
+#' @return List with components:
+#'   - columns (optional): output from col_stats()
+#'   - all: output from all_stats()
+#'   - groups (optional): output from group_stats()
+#' @export
+get_stats <- function(
+    data,
+    group = NULL,
+    types = NULL,
+    quick = TRUE,
+    moments = TRUE,
+    coerce_numeric = TRUE
+) {
+  if (!is.data.frame(data)) .stopf("data must be a data.frame.")
+  
+  out <- list()
+  
+  if (quick) out$columns <- col_stats(data)
+  
+  out$all <- all_stats(data, types = types, moments = moments, coerce_numeric = coerce_numeric)
+  
+  if (!is.null(group)) {
+    out$groups <- group_stats(
+      data,
+      group,
+      types = types,
+      moments = moments,
+      coerce_numeric = coerce_numeric
+    )
+  }
+  
+  out
+}
+
+# -----------------------
+# UAT print helper
+# -----------------------
+
+#' Print UAT output
+#'
+#' Prints a simple, consistent display for test results.
+#'
+#' @param test_name Test name.
+#' @param result Result to display.
+#' @param expected Optional expected result description.
+#' @param note Optional note.
 #'
 #' @export
-print_uat <- function(test_name, result, expected = NULL, note = "") {
+uat_print <- function(test_name, result, expected = NULL, note = "") {
   cat(sprintf("TEST: %s\n", test_name))
-  if (!is.null(expected)) {
-    cat(sprintf("  Expected: %s\n", expected))
-  }
+  if (!is.null(expected)) cat(sprintf("  Expected: %s\n", expected))
   cat(sprintf("  Result:   %s\n", result))
-  if (note != "") {
-    cat(sprintf("  Note: %s\n", note))
-  }
+  if (nzchar(note)) cat(sprintf("  Note: %s\n", note))
   cat("------------------------------------------------------\n")
 }
 
-# --- Library Loads and Logger Setup ---
-library(moments)
-library(sf)
-library(assertthat)
-library(futile.logger)
-library(data.table)
+# -----------------------
+# UAT runner
+# -----------------------
 
-# Set up a global debug flag and logging configuration
-DEBUG <- TRUE
-futile.logger::flog.threshold(INFO)
-futile.logger::flog.appender(futile.logger::appender.console())
-
-# --- Run User Acceptance Tests (UAT) ---
-#' Run User Acceptance Tests (UAT)
+#' Run UAT checks
 #'
-#' This script block runs a series of UAT tests for the functions defined in the package.
-#' It tests each function with different inputs and prints out formatted results.
-#' The UAT tests include checks for correct output, error handling, and type conversions.
-#' Detailed debug output is provided to facilitate troubleshooting.
+#' Executes a small set of checks that validate expected behavior for the key functions.
 #'
-#' @examples
-#' \dontrun{
-#'   # Run the UAT tests:
-#'   all_tests_passed <- TRUE
-#'
-#'   cat("==== Testing calculate_mode() ====\n")
-#'   vec <- c(1, 2, 2, 3, 3, NA)
-#'   res_string <- calculate_mode(vec, return_type = "string")
-#'   res_vector <- calculate_mode(vec, return_type = "vector")
-#'   res_first  <- calculate_mode(vec, return_type = "first")
-#'   res_count  <- calculate_mode(vec, return_type = "count")
-#'
-#'   if (grepl("2", res_string) && grepl("3", res_string)) {
-#'     print_uat("calculate_mode (string)", res_string, "contains both 2 and 3")
-#'   } else {
-#'     print_uat("calculate_mode (string)", res_string, "contains both 2 and 3", "FAIL")
-#'     all_tests_passed <- FALSE
-#'   }
-#'
-#'   if (all(sort(res_vector) == c(2, 3))) {
-#'     print_uat("calculate_mode (vector)", paste(res_vector, collapse = ", "), "2, 3")
-#'   } else {
-#'     print_uat("calculate_mode (vector)", paste(res_vector, collapse = ", "), "2, 3", "FAIL")
-#'     all_tests_passed <- FALSE
-#'   }
-#'
-#'   if (res_first %in% c(2, 3)) {
-#'     print_uat("calculate_mode (first)", res_first, "2 or 3")
-#'   } else {
-#'     print_uat("calculate_mode (first)", res_first, "2 or 3", "FAIL")
-#'     all_tests_passed <- FALSE
-#'   }
-#'
-#'   if (res_count == 2) {
-#'     print_uat("calculate_mode (count)", res_count, "2")
-#'   } else {
-#'     print_uat("calculate_mode (count)", res_count, "2", "FAIL")
-#'     all_tests_passed <- FALSE
-#'   }
-#'
-#'   # Additional tests for safe_numeric(), get_date_stats(), get_factor_stats(), get_gis_stats(),
-#'   # get_multi_stats(), get_numeric_stats(), get_all_stats(), and get_group_stats() are included.
-#'
-#'   if (all_tests_passed) {
-#'     cat("\n===== ALL UAT TESTS PASSED =====\n")
-#'   } else {
-#'     cat("\n===== SOME UAT TESTS FAILED =====\n")
-#'   }
-#' }
-#'
+#' @param verbose If TRUE, prints test results using uat_print().
+#' @return TRUE if all checks pass, otherwise FALSE.
 #' @export
-NULL
+run_uat <- function(verbose = TRUE) {
+  pass <- TRUE
+  
+  check <- function(name, ok, got = NULL, expected = NULL) {
+    if (!isTRUE(ok)) pass <<- FALSE
+    if (verbose) {
+      uat_print(
+        test_name = name,
+        result = if (isTRUE(ok)) "PASS" else paste0("FAIL", if (!is.null(got)) paste0(" (got: ", got, ")") else ""),
+        expected = expected
+      )
+    }
+  }
+  
+  # mode_value
+  v <- c(1, 2, 2, 3, 3, NA)
+  ms <- mode_value(v, "string")
+  mv <- mode_value(v, "vector")
+  mf <- mode_value(v, "first", ties = "first")
+  mc <- mode_value(v, "count")
+  
+  check("mode_value(string) contains 2 and 3",
+        grepl("2", ms) && grepl("3", ms),
+        got = ms,
+        expected = "contains both 2 and 3")
+  
+  check("mode_value(vector) equals c(2,3) ignoring order",
+        identical(sort(as.numeric(mv)), c(2, 3)),
+        got = paste(mv, collapse = ", "),
+        expected = "2, 3")
+  
+  check("mode_value(first) is 2 or 3",
+        mf %in% c(2, 3),
+        got = as.character(mf),
+        expected = "2 or 3")
+  
+  check("mode_value(count) == 2",
+        identical(mc, 2L),
+        got = as.character(mc),
+        expected = "2")
+  
+  # to_numeric
+  x1 <- factor(c("1", "2", "3"))
+  y1 <- to_numeric(x1)
+  check("to_numeric(factor) parses numbers",
+        identical(y1, c(1, 2, 3)),
+        got = paste(y1, collapse = ", "),
+        expected = "1, 2, 3")
+  
+  x2 <- c("1,000", "2,500", NA)
+  y2 <- to_numeric(x2)
+  check("to_numeric removes commas",
+        identical(y2, c(1000, 2500, NA_real_)),
+        got = paste(y2, collapse = ", "),
+        expected = "1000, 2500, NA")
+  
+  x3 <- c("abc", "def")
+  y3 <- to_numeric(x3, strict = TRUE)
+  check("to_numeric(strict) returns all NA when parsing fails",
+        all(is.na(y3)),
+        got = paste(y3, collapse = ", "),
+        expected = "all NA")
+  
+  # date_stats
+  d <- c("2020-01-01", "2020-01-03", "2020-01-02", NA)
+  ds <- date_stats(d, middle_as = "character")
+  check("date_stats span == 2",
+        identical(ds$span, 2),
+        got = as.character(ds$span),
+        expected = "2")
+  check("date_stats invalid >= 1",
+        ds$invalid >= 1,
+        got = as.character(ds$invalid),
+        expected = ">= 1")
+  check("date_stats max_gap == 1",
+        identical(ds$max_gap, 1),
+        got = as.character(ds$max_gap),
+        expected = "1")
+  
+  # factor_stats
+  f <- factor(c("a", "a", "b", NA))
+  fs <- factor_stats(f, strict = TRUE, include_na = TRUE)
+  check("factor_stats levels_count == 2",
+        identical(fs$levels_count, 2L),
+        got = as.character(fs$levels_count),
+        expected = "2")
+  
+  # col_stats / all_stats / group_stats
+  .require_pkg("data.table")
+  df <- data.frame(
+    grp = c("g1", "g1", "g2", NA),
+    num = c(1, 2, NA, 4),
+    chr = c("x", "yy", NA, "zzz"),
+    stringsAsFactors = FALSE
+  )
+  
+  cs <- col_stats(df)
+  check("col_stats returns one row per column",
+        nrow(cs) == ncol(df),
+        got = as.character(nrow(cs)),
+        expected = as.character(ncol(df)))
+  
+  as1 <- all_stats(df)
+  check("all_stats returns list with expected keys",
+        all(c("Numeric", "Factor", "Date", "Character", "Other") %in% names(as1[[1]])),
+        got = paste(names(as1[[1]]), collapse = ", "),
+        expected = "Numeric, Factor, Date, Character, Other")
+  
+  gs <- group_stats(df, "grp")
+  check("group_stats returns groups including NA label",
+        all(c("g1", "g2", "NA") %in% names(gs)),
+        got = paste(names(gs), collapse = ", "),
+        expected = "g1, g2, NA")
+  
+  # gis_stats (optional)
+  if (requireNamespace("sf", quietly = TRUE)) {
+    coords <- data.frame(longitude = c(-87.62, -87.63), latitude = c(41.88, 41.89))
+    gss <- gis_stats(coords, distance_matrix = TRUE, nearest = TRUE, max_n_matrix = 1000L)
+    check("gis_stats returns n_points == 2",
+          identical(gss$n_points, 2L),
+          got = as.character(gss$n_points),
+          expected = "2")
+    check("gis_stats nearest_index length == 2",
+          length(gss$nearest_index) == 2L,
+          got = as.character(length(gss$nearest_index)),
+          expected = "2")
+  } else {
+    if (verbose) cat("NOTE: sf not installed; skipping gis_stats checks.\n")
+  }
+  
+  if (verbose) cat(if (pass) "\nALL UAT CHECKS PASSED\n" else "\nSOME UAT CHECKS FAILED\n")
+  pass
+}
