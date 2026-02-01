@@ -1,576 +1,582 @@
-# Load required packages
-library(dplyr)
-library(tidyr)
-library(tidyselect)
-library(progress)
-library(assertthat)
+# ------------------------------------------------------------------------------
+# Multitouch attribution utilities
+# ------------------------------------------------------------------------------
 
-# ------------------------------------------------------------------------------
-# Helper function: Validate input data
-# ------------------------------------------------------------------------------
-#' Validate Input Data for MTA Functions
+#' Validate input data for multitouch attribution
 #'
-#' Checks that the data frame is valid (i.e. is a data.frame and contains the required columns).
-#'
-#' @param data A data frame to be validated.
-#' @param required_columns A character vector of required column names.
-#'   Default: c("customer_id", "touchpoint", "conversion", "timestamp").
-#'
-#' @return Invisibly returns TRUE if the data is valid; otherwise, stops with an error.
+#' @param data A data.frame.
+#' @param required_columns Character vector of required columns.
+#' @return Invisibly TRUE when checks pass.
 #' @export
-mta_validate_data <- function(data, required_columns = c("customer_id", "touchpoint", "conversion", "timestamp")) {
+mta_validate_data <- function(
+    data,
+    required_columns = c("customer_id", "touchpoint", "conversion", "timestamp")
+) {
   if (!is.data.frame(data)) {
-    stop("The input data should be a data.frame.")
+    stop("`data` must be a data.frame.")
   }
-  missing_cols <- setdiff(required_columns, colnames(data))
+  
+  missing_cols <- setdiff(required_columns, names(data))
   if (length(missing_cols) > 0) {
-    stop("The following required columns are missing from the data: ", paste(missing_cols, collapse = ", "))
+    stop("Missing required columns: ", paste(missing_cols, collapse = ", "))
   }
-  # Check that the timestamp column is of a proper date/time class
-  if (!inherits(data$timestamp, "POSIXct") && !inherits(data$timestamp, "POSIXt")) {
-    warning("The 'timestamp' column is not of POSIXct/POSIXt type. Attempting to convert using as.POSIXct.")
-    data$timestamp <- as.POSIXct(data$timestamp)
-    if (any(is.na(data$timestamp))) {
-      stop("Conversion of 'timestamp' to POSIXct resulted in NA values.")
-    }
+  
+  if (anyNA(data$customer_id)) stop("`customer_id` contains NA.")
+  if (anyNA(data$touchpoint)) stop("`touchpoint` contains NA.")
+  if (anyNA(data$timestamp)) stop("`timestamp` contains NA.")
+  
+  if (!is.logical(data$conversion) && !is.numeric(data$conversion) && !is.integer(data$conversion)) {
+    stop("`conversion` must be logical or numeric.")
   }
-  # Ensure conversion is numeric or logical
-  if (!is.numeric(data$conversion) && !is.logical(data$conversion)) {
-    stop("The 'conversion' column should be numeric or logical.")
+  
+  ts_ok <- inherits(data$timestamp, "POSIXct") || inherits(data$timestamp, "POSIXt")
+  if (!ts_ok) {
+    ts_try <- suppressWarnings(as.POSIXct(data$timestamp, tz = "UTC"))
+    if (anyNA(ts_try)) stop("`timestamp` must be convertible to POSIXct without NA.")
   }
-  return(invisible(TRUE))
+  
+  invisible(TRUE)
 }
 
 # ------------------------------------------------------------------------------
-# Function: Rename columns
+# Internal helpers
 # ------------------------------------------------------------------------------
-#' Rename Columns of a Data Frame for MTA Analysis
+
+.mta_to_posixct <- function(x, tz = "UTC") {
+  if (inherits(x, "POSIXct") || inherits(x, "POSIXt")) return(as.POSIXct(x, tz = tz))
+  out <- suppressWarnings(as.POSIXct(x, tz = tz))
+  if (anyNA(out)) stop("`timestamp` conversion produced NA.")
+  out
+}
+
+.mta_to_01_int <- function(x) {
+  if (is.logical(x)) return(as.integer(!is.na(x) & x))
+  if (is.numeric(x) || is.integer(x)) return(as.integer(!is.na(x) & x != 0))
+  stop("`conversion` must be logical or numeric.")
+}
+
+.mta_is_prepared <- function(data) {
+  isTRUE(attr(data, "mta_prepared")) &&
+    all(c("touch_rank", "touch_n") %in% names(data))
+}
+
+.mta_normalize <- function(df, credit_col = "conversions") {
+  total <- sum(df[[credit_col]], na.rm = TRUE)
+  if (!is.finite(total) || total <= 0) {
+    df$attribution_weight <- 0
+    return(df)
+  }
+  df$attribution_weight <- df[[credit_col]] / total
+  df
+}
+
+.mta_dt_available <- function() {
+  requireNamespace("data.table", quietly = TRUE)
+}
+
+# ------------------------------------------------------------------------------
+# Column rename utility
+# ------------------------------------------------------------------------------
+
+#' Rename columns for multitouch attribution
 #'
-#' Renames the specified columns of a data frame. The new column names must be chosen from
-#' c("customer_id", "touchpoint", "conversion", "timestamp"). You may specify the columns to rename
-#' by name or by position.
-#'
-#' @param data A data frame whose columns need to be renamed.
-#' @param current_names_or_positions A character vector (column names) or numeric vector (column positions)
-#'   indicating the columns to rename.
-#' @param new_names A character vector indicating the new column names.
-#'
-#' @return A data frame with the specified columns renamed.
-#' @examples
-#' # Rename by name:
-#' df <- data.frame(cust_id = 1:3, tp = c("A", "B", "C"), conv = c(0, 1, 0),
-#'                  ts = as.POSIXct(Sys.Date() - 0:2))
-#' df_new <- mta_rename(df, current_names_or_positions = c("cust_id", "tp", "conv", "ts"),
-#'                      new_names = c("customer_id", "touchpoint", "conversion", "timestamp"))
-#'
-#' # Rename by column positions:
-#' df_new2 <- mta_rename(df, current_names_or_positions = 1:4,
-#'                       new_names = c("customer_id", "touchpoint", "conversion", "timestamp"))
+#' @param data A data.frame.
+#' @param current_names_or_positions Character (names) or numeric (positions).
+#' @param new_names Character vector of new names.
+#' @return A data.frame with renamed columns.
 #' @export
 mta_rename <- function(data, current_names_or_positions, new_names) {
-  # Ensure data is a data frame
-  if (!is.data.frame(data)) {
-    stop("The input data should be a data.frame.")
-  }
+  if (!is.data.frame(data)) stop("`data` must be a data.frame.")
   if (length(current_names_or_positions) != length(new_names)) {
-    stop("The lengths of 'current_names_or_positions' and 'new_names' must be equal.")
+    stop("`current_names_or_positions` and `new_names` must have the same length.")
   }
   
   allowed_new_names <- c("customer_id", "touchpoint", "conversion", "timestamp")
   if (any(!new_names %in% allowed_new_names)) {
-    stop("New column names must be one or more of: ", paste(allowed_new_names, collapse = ", "))
+    stop("`new_names` must be drawn from: ", paste(allowed_new_names, collapse = ", "))
+  }
+  if (anyDuplicated(new_names)) stop("`new_names` must be unique.")
+  
+  old <- current_names_or_positions
+  if (is.numeric(old)) {
+    if (any(old < 1 | old > ncol(data))) stop("Column positions out of bounds.")
+    old <- names(data)[old]
   }
   
-  # If current_names_or_positions is numeric, convert to column names
-  if (is.numeric(current_names_or_positions)) {
-    if (any(current_names_or_positions < 1 | current_names_or_positions > ncol(data))) {
-      stop("One or more column positions in 'current_names_or_positions' are out of bounds.")
-    }
-    current_names_or_positions <- colnames(data)[current_names_or_positions]
+  missing_old <- setdiff(old, names(data))
+  if (length(missing_old) > 0) {
+    stop("Columns not present in `data`: ", paste(missing_old, collapse = ", "))
   }
   
-  missing_cols <- setdiff(current_names_or_positions, colnames(data))
-  if (length(missing_cols) > 0) {
-    stop("The following columns specified in 'current_names_or_positions' do not exist in the data: ",
-         paste(missing_cols, collapse = ", "))
-  }
+  out_names <- names(data)
+  out_names[match(old, out_names)] <- new_names
   
-  # Create a renaming mapping: for each column (e.g., "cust_id") return the corresponding new name (e.g., "customer_id")
-  renaming_map <- setNames(new_names, current_names_or_positions)
+  if (anyDuplicated(out_names)) stop("Renaming results in duplicate column names.")
   
-  # Use rename_with so that for each column in current_names_or_positions, its new name is taken from renaming_map
-  data_renamed <- data %>%
-    rename_with(~ renaming_map[.], all_of(current_names_or_positions))
-  
-  return(data_renamed)
+  names(data) <- out_names
+  data
 }
 
 # ------------------------------------------------------------------------------
-# Function: Prepare data for attribution analysis
+# Data preparation
 # ------------------------------------------------------------------------------
-#' Prepare Data for Attribution Models
+
+#' Prepare data for attribution models
 #'
-#' Sorts the data by customer and timestamp, and adds a 'touch_rank' column indicating the order
-#' of touchpoints in each customer journey.
+#' Produces one conversion path per customer by trimming touchpoints to a conversion cutoff.
 #'
-#' @param data A data frame containing at least 'customer_id', 'touchpoint', 'conversion', and 'timestamp' columns.
-#'
-#' @return A data frame with the added 'touch_rank' column.
+#' @param data A data.frame with customer_id, touchpoint, conversion, timestamp.
+#' @param conversion_event Conversion cutoff per customer: "first" or "last".
+#' @param tz Timezone used when coercing timestamps.
+#' @return A data.frame containing converting paths with touch_rank and touch_n.
 #' @export
-mta_prep <- function(data) {
-  # Validate the input data
+mta_prep <- function(data, conversion_event = c("first", "last"), tz = "UTC") {
+  conversion_event <- match.arg(conversion_event)
+  
   mta_validate_data(data)
   
   if (nrow(data) == 0) {
-    warning("The input data is empty. Returning an empty data frame.")
-    return(data)
+    out <- data
+    attr(out, "mta_prepared") <- TRUE
+    attr(out, "mta_total_conversions") <- 0L
+    return(out)
   }
   
-  data_prepared <- data %>%
-    arrange(customer_id, timestamp) %>%
-    group_by(customer_id) %>%
-    mutate(touch_rank = row_number()) %>%
-    ungroup()
+  data$customer_id <- as.character(data$customer_id)
+  data$touchpoint  <- as.character(data$touchpoint)
+  data$conversion  <- .mta_to_01_int(data$conversion)
+  data$timestamp   <- .mta_to_posixct(data$timestamp, tz = tz)
   
-  return(data_prepared)
+  if (.mta_dt_available()) {
+    dt <- data.table::as.data.table(data.table::copy(data))
+    dt[, .row_id := .I]
+    data.table::setorderv(dt, c("customer_id", "timestamp", ".row_id"))
+    
+    dt[, .conv_time := {
+      if (!any(conversion == 1L)) as.POSIXct(NA, tz = tz)
+      else if (conversion_event == "first") min(timestamp[conversion == 1L])
+      else max(timestamp[conversion == 1L])
+    }, by = "customer_id"]
+    
+    dt <- dt[!is.na(.conv_time) & timestamp <= .conv_time]
+    dt[, touch_rank := seq_len(.N), by = "customer_id"]
+    dt[, touch_n := .N, by = "customer_id"]
+    
+    out <- as.data.frame(dt[, c("customer_id", "touchpoint", "conversion", "timestamp", "touch_rank", "touch_n")])
+    attr(out, "mta_prepared") <- TRUE
+    attr(out, "mta_total_conversions") <- length(unique(out$customer_id))
+    return(out)
+  }
+  
+  if (!requireNamespace("dplyr", quietly = TRUE)) {
+    stop("Package `dplyr` is required when `data.table` is not available.")
+  }
+  
+  d <- dplyr::as_tibble(data)
+  d$.row_id <- seq_len(nrow(d))
+  d <- dplyr::arrange(d, customer_id, timestamp, .row_id)
+  
+  d <- dplyr::group_by(d, customer_id)
+  d$.conv_time <- {
+    has_conv <- any(d$conversion == 1L)
+    if (!has_conv) as.POSIXct(NA, tz = tz)
+    else if (conversion_event == "first") min(d$timestamp[d$conversion == 1L])
+    else max(d$timestamp[d$conversion == 1L])
+  }
+  d <- dplyr::ungroup(d)
+  
+  d <- dplyr::filter(d, !is.na(.conv_time) & timestamp <= .conv_time)
+  
+  d <- dplyr::group_by(d, customer_id)
+  d <- dplyr::mutate(d, touch_rank = dplyr::row_number(), touch_n = dplyr::n())
+  d <- dplyr::ungroup(d)
+  
+  out <- dplyr::select(d, customer_id, touchpoint, conversion, timestamp, touch_rank, touch_n)
+  out <- as.data.frame(out)
+  attr(out, "mta_prepared") <- TRUE
+  attr(out, "mta_total_conversions") <- length(unique(out$customer_id))
+  out
 }
 
 # ------------------------------------------------------------------------------
-# Function: Linear attribution model
+# Attribution models
 # ------------------------------------------------------------------------------
-#' Linear Attribution Model
+
+#' Linear attribution
 #'
-#' Calculates linear attribution weights, assigning equal credit to all touchpoints.
-#'
-#' @param data A prepared data frame with 'customer_id', 'touchpoint', 'conversion', 'timestamp',
-#'   and 'touch_rank' columns.
-#'
-#' @return A data frame with columns 'touchpoint', 'conversions', and 'attribution_weight'.
+#' @param data Prepared data from mta_prep(), or raw data (auto-prep).
+#' @return data.frame with touchpoint, conversions, attribution_weight.
 #' @export
 mta_linear <- function(data) {
+  if (!.mta_is_prepared(data)) data <- mta_prep(data)
+  
   if (nrow(data) == 0) {
-    warning("The input data is empty. Returning an empty data frame for linear attribution.")
-    return(data.frame(touchpoint = character(), conversions = numeric(), attribution_weight = numeric(), 
-                      stringsAsFactors = FALSE))
+    return(data.frame(touchpoint = character(), conversions = numeric(), attribution_weight = numeric()))
   }
   
-  result <- data %>%
-    group_by(touchpoint) %>%
-    summarise(conversions = sum(conversion, na.rm = TRUE), .groups = "drop")
-  
-  total_conv <- sum(result$conversions)
-  if (total_conv == 0) {
-    result <- result %>% mutate(attribution_weight = 0)
-    warning("Total conversions are zero in linear attribution model.")
-  } else {
-    result <- result %>% mutate(attribution_weight = conversions / total_conv)
+  if (.mta_dt_available()) {
+    dt <- data.table::as.data.table(data.table::copy(data))
+    dt[, credit := 1 / touch_n]
+    res <- dt[, .(conversions = sum(credit)), by = "touchpoint"]
+    res <- as.data.frame(res)
+    res <- .mta_normalize(res, "conversions")
+    return(res)
   }
   
-  return(result)
+  if (!requireNamespace("dplyr", quietly = TRUE)) stop("Package `dplyr` is required.")
+  d <- dplyr::as_tibble(data)
+  res <- dplyr::summarise(
+    dplyr::group_by(d, touchpoint),
+    conversions = sum(1 / touch_n),
+    .groups = "drop"
+  )
+  res <- as.data.frame(res)
+  .mta_normalize(res, "conversions")
 }
 
-# ------------------------------------------------------------------------------
-# Function: First touch attribution model
-# ------------------------------------------------------------------------------
-#' First Touch Attribution Model
+#' First-touch attribution
 #'
-#' Assigns full credit to the first touchpoint in each customer journey.
-#'
-#' @param data A prepared data frame with 'customer_id', 'touchpoint', 'conversion', 'timestamp',
-#'   and 'touch_rank' columns.
-#'
-#' @return A data frame with columns 'touchpoint', 'conversions', and 'attribution_weight'.
+#' @param data Prepared data from mta_prep(), or raw data (auto-prep).
+#' @return data.frame with touchpoint, conversions, attribution_weight.
 #' @export
 mta_first <- function(data) {
-  first_touch <- data %>%
-    filter(touch_rank == 1)
+  if (!.mta_is_prepared(data)) data <- mta_prep(data)
   
-  if (nrow(first_touch) == 0) {
-    warning("No first touch records found. Returning empty result for first touch attribution.")
-    return(data.frame(touchpoint = character(), conversions = numeric(), attribution_weight = numeric(), 
-                      stringsAsFactors = FALSE))
+  if (nrow(data) == 0) {
+    return(data.frame(touchpoint = character(), conversions = numeric(), attribution_weight = numeric()))
   }
   
-  result <- first_touch %>%
-    group_by(touchpoint) %>%
-    summarise(conversions = sum(conversion, na.rm = TRUE), .groups = "drop")
-  
-  total_conv <- sum(result$conversions)
-  if (total_conv == 0) {
-    result <- result %>% mutate(attribution_weight = 0)
-    warning("Total conversions are zero in first touch attribution model.")
-  } else {
-    result <- result %>% mutate(attribution_weight = conversions / total_conv)
+  if (.mta_dt_available()) {
+    dt <- data.table::as.data.table(data.table::copy(data))
+    res <- dt[touch_rank == 1L, .(conversions = .N), by = "touchpoint"]
+    res <- as.data.frame(res)
+    res <- .mta_normalize(res, "conversions")
+    return(res)
   }
   
-  return(result)
+  if (!requireNamespace("dplyr", quietly = TRUE)) stop("Package `dplyr` is required.")
+  d <- dplyr::as_tibble(data)
+  d <- dplyr::filter(d, touch_rank == 1L)
+  res <- dplyr::summarise(dplyr::group_by(d, touchpoint), conversions = dplyr::n(), .groups = "drop")
+  res <- as.data.frame(res)
+  .mta_normalize(res, "conversions")
 }
 
-# ------------------------------------------------------------------------------
-# Function: Last touch attribution model
-# ------------------------------------------------------------------------------
-#' Last Touch Attribution Model
+#' Last-touch attribution
 #'
-#' Assigns full credit to the last touchpoint that resulted in a conversion.
-#'
-#' @param data A prepared data frame with 'customer_id', 'touchpoint', 'conversion', 'timestamp',
-#'   and 'touch_rank' columns.
-#'
-#' @return A data frame with columns 'touchpoint', 'conversions', and 'attribution_weight'.
+#' @param data Prepared data from mta_prep(), or raw data (auto-prep).
+#' @return data.frame with touchpoint, conversions, attribution_weight.
 #' @export
 mta_last <- function(data) {
-  last_touch <- data %>%
-    filter(conversion == 1) %>%
-    group_by(customer_id) %>%
-    arrange(desc(timestamp)) %>%
-    slice(1) %>%
-    ungroup()
+  if (!.mta_is_prepared(data)) data <- mta_prep(data)
   
-  if (nrow(last_touch) == 0) {
-    warning("No conversion records found for last touch attribution. Returning empty result.")
-    return(data.frame(touchpoint = character(), conversions = numeric(), attribution_weight = numeric(), 
-                      stringsAsFactors = FALSE))
+  if (nrow(data) == 0) {
+    return(data.frame(touchpoint = character(), conversions = numeric(), attribution_weight = numeric()))
   }
   
-  result <- last_touch %>%
-    group_by(touchpoint) %>%
-    summarise(conversions = n(), .groups = "drop")
-  
-  total_conv <- sum(result$conversions)
-  if (total_conv == 0) {
-    result <- result %>% mutate(attribution_weight = 0)
-    warning("Total conversions are zero in last touch attribution model.")
-  } else {
-    result <- result %>% mutate(attribution_weight = conversions / total_conv)
+  if (.mta_dt_available()) {
+    dt <- data.table::as.data.table(data.table::copy(data))
+    res <- dt[touch_rank == touch_n, .(conversions = .N), by = "touchpoint"]
+    res <- as.data.frame(res)
+    res <- .mta_normalize(res, "conversions")
+    return(res)
   }
   
-  return(result)
+  if (!requireNamespace("dplyr", quietly = TRUE)) stop("Package `dplyr` is required.")
+  d <- dplyr::as_tibble(data)
+  d <- dplyr::filter(d, touch_rank == touch_n)
+  res <- dplyr::summarise(dplyr::group_by(d, touchpoint), conversions = dplyr::n(), .groups = "drop")
+  res <- as.data.frame(res)
+  .mta_normalize(res, "conversions")
 }
 
-# ------------------------------------------------------------------------------
-# Function: Position-based attribution model
-# ------------------------------------------------------------------------------
-#' Position-Based Attribution Model
+#' Position-based attribution
 #'
-#' Calculates attribution weights based on the position of each touchpoint in the customer journey.
-#' The weights for the first and last touchpoints are specified by the user (default 0.4 each), and
-#' the remaining (middle) touchpoints share the remaining weight equally.
-#'
-#' @param data A prepared data frame with columns 'customer_id', 'touchpoint', 'conversion', 'timestamp', and 'touch_rank'.
-#' @param first_touch_weight Numeric; the weight for the first touch (default: 0.4).
-#' @param last_touch_weight Numeric; the weight for the last touch (default: 0.4).
-#'
-#' @return A data frame with columns 'touchpoint', 'conversion_weight', and 'attribution_weight'.
+#' @param data Prepared data from mta_prep(), or raw data (auto-prep).
+#' @param first_touch_weight Weight on the first touchpoint.
+#' @param last_touch_weight Weight on the last touchpoint.
+#' @return data.frame with touchpoint, conversions, attribution_weight.
 #' @export
 mta_position <- function(data, first_touch_weight = 0.4, last_touch_weight = 0.4) {
-  if (first_touch_weight + last_touch_weight > 1) {
-    stop("The sum of first_touch_weight and last_touch_weight should not exceed 1.")
+  if (!is.numeric(first_touch_weight) || !is.numeric(last_touch_weight)) {
+    stop("Position weights must be numeric.")
+  }
+  if (first_touch_weight < 0 || last_touch_weight < 0) stop("Position weights must be non-negative.")
+  if (first_touch_weight + last_touch_weight > 1) stop("Position weights must sum to <= 1.")
+  
+  if (!.mta_is_prepared(data)) data <- mta_prep(data)
+  
+  if (nrow(data) == 0) {
+    return(data.frame(touchpoint = character(), conversions = numeric(), attribution_weight = numeric()))
   }
   
-  middle_touch_weight <- 1 - first_touch_weight - last_touch_weight
+  middle_weight <- 1 - first_touch_weight - last_touch_weight
   
-  data_position <- data %>%
-    group_by(customer_id) %>%
-    mutate(
-      total_touchpoints = n(),
-      position_weight = case_when(
-        # If only one touchpoint, assign full credit if conversion occurred
-        total_touchpoints == 1 ~ ifelse(conversion == 1, 1, 0),
-        # First touch
-        touch_rank == 1 ~ first_touch_weight,
-        # Last touch (using explicit ranking)
-        touch_rank == total_touchpoints ~ last_touch_weight,
-        # Middle touchpoints
-        TRUE ~ middle_touch_weight / (total_touchpoints - 2)
-      )
-    ) %>%
-    ungroup()
-  
-  result <- data_position %>%
-    group_by(touchpoint) %>%
-    summarise(conversion_weight = sum(conversion * position_weight, na.rm = TRUE), .groups = "drop")
-  
-  total_weight <- sum(result$conversion_weight)
-  if (total_weight == 0) {
-    result <- result %>% mutate(attribution_weight = 0)
-    warning("Total conversion weight is zero in position-based attribution model.")
-  } else {
-    result <- result %>% mutate(attribution_weight = conversion_weight / total_weight)
+  if (.mta_dt_available()) {
+    dt <- data.table::as.data.table(data.table::copy(data))
+    
+    dt[, credit := {
+      n0 <- touch_n[1L]
+      
+      if (n0 == 1L) {
+        rep(1, .N)
+      } else if (n0 == 2L) {
+        data.table::fifelse(
+          touch_rank == 1L,
+          first_touch_weight + middle_weight / 2,
+          last_touch_weight + middle_weight / 2
+        )
+      } else {
+        data.table::fcase(
+          touch_rank == 1L, first_touch_weight,
+          touch_rank == n0, last_touch_weight,
+          default = middle_weight / (n0 - 2L)
+        )
+      }
+    }, by = "customer_id"]
+    
+    res <- dt[, .(conversions = sum(credit)), by = "touchpoint"]
+    res <- as.data.frame(res)
+    res <- .mta_normalize(res, "conversions")
+    return(res)
   }
   
-  return(result)
+  if (!requireNamespace("dplyr", quietly = TRUE)) stop("Package `dplyr` is required.")
+  d <- dplyr::as_tibble(data)
+  
+  d <- dplyr::group_by(d, customer_id)
+  d <- dplyr::mutate(
+    d,
+    conversions = dplyr::case_when(
+      touch_n == 1L ~ 1,
+      touch_n == 2L & touch_rank == 1L ~ first_touch_weight + middle_weight / 2,
+      touch_n == 2L & touch_rank == 2L ~ last_touch_weight + middle_weight / 2,
+      touch_rank == 1L ~ first_touch_weight,
+      touch_rank == touch_n ~ last_touch_weight,
+      TRUE ~ middle_weight / (touch_n - 2L)
+    )
+  )
+  d <- dplyr::ungroup(d)
+  
+  res <- dplyr::summarise(dplyr::group_by(d, touchpoint), conversions = sum(conversions), .groups = "drop")
+  res <- as.data.frame(res)
+  .mta_normalize(res, "conversions")
 }
 
 # ------------------------------------------------------------------------------
-# Function: Wrapper for Multitouch Attribution Analysis
+# Analysis wrapper
 # ------------------------------------------------------------------------------
-#' Multitouch Attribution Analysis
+
+#' Multitouch attribution analysis
 #'
-#' Calculates attribution weights for multiple models (linear, first touch, last touch, position-based)
-#' and returns the results as a list.
-#'
-#' @param data A data frame with 'customer_id', 'touchpoint', 'conversion', and 'timestamp' columns.
-#' @param models A character vector specifying the attribution models to calculate.
-#'   Default: c("linear", "first_touch", "last_touch", "position_based").
-#' @param progress_bar Logical; whether to display a progress bar during analysis (default: FALSE).
-#'
-#' @return A named list with the attribution results for each specified model.
+#' @param data Raw or prepared data.
+#' @param models Character vector of model names.
+#' @param progress_bar Logical for progress output.
+#' @param conversion_event Conversion cutoff per customer: "first" or "last".
+#' @param position_first_touch_weight First-touch weight for position-based.
+#' @param position_last_touch_weight Last-touch weight for position-based.
+#' @param tz Timezone used when coercing timestamps.
+#' @return Named list of model result data.frames.
 #' @export
-mta_analysis <- function(data, models = c("linear", "first_touch", "last_touch", "position_based"), progress_bar = FALSE) {
-  # Validate input data and models
-  mta_validate_data(data)
+mta_analysis <- function(
+    data,
+    models = c("linear", "first_touch", "last_touch", "position_based"),
+    progress_bar = FALSE,
+    conversion_event = c("first", "last"),
+    position_first_touch_weight = 0.4,
+    position_last_touch_weight = 0.4,
+    tz = "UTC"
+) {
   valid_models <- c("linear", "first_touch", "last_touch", "position_based")
+  if (!is.character(models) || length(models) == 0) stop("`models` must be a non-empty character vector.")
+  if (any(!models %in% valid_models)) stop("Invalid model(s): ", paste(setdiff(models, valid_models), collapse = ", "))
+  if (!is.logical(progress_bar) || length(progress_bar) != 1) stop("`progress_bar` must be TRUE/FALSE.")
   
-  if (!all(models %in% valid_models)) {
-    stop("Invalid model(s) provided. Choose from: ", paste(valid_models, collapse = ", "))
-  }
+  conversion_event <- match.arg(conversion_event)
   
-  if (!is.logical(progress_bar)) {
-    stop("The 'progress_bar' parameter should be logical (TRUE or FALSE).")
-  }
-  
-  data_prepared <- mta_prep(data)
-  attribution_results <- list()
+  prepared <- if (.mta_is_prepared(data)) data else mta_prep(data, conversion_event = conversion_event, tz = tz)
   
   if (progress_bar) {
-    pb <- progress::progress_bar$new(total = length(models),
-                                     format = "Calculating :current/:total [:bar] :percent ETA: :eta")
+    if (!requireNamespace("progress", quietly = TRUE)) stop("Package `progress` is required for progress output.")
+    pb <- progress::progress_bar$new(
+      total = length(models),
+      format = "Calculating :current/:total [:bar] :percent ETA: :eta"
+    )
   }
   
-  for (model in models) {
-    if (model == "linear") {
-      attribution_results[["linear"]] <- mta_linear(data_prepared)
-    } else if (model == "first_touch") {
-      attribution_results[["first_touch"]] <- mta_first(data_prepared)
-    } else if (model == "last_touch") {
-      attribution_results[["last_touch"]] <- mta_last(data_prepared)
-    } else if (model == "position_based") {
-      attribution_results[["position_based"]] <- mta_position(data_prepared)
-    }
-    
-    if (progress_bar) {
-      pb$tick()
-    }
+  out <- vector("list", length(models))
+  names(out) <- models
+  
+  for (i in seq_along(models)) {
+    m <- models[[i]]
+    out[[i]] <- switch(
+      m,
+      linear = mta_linear(prepared),
+      first_touch = mta_first(prepared),
+      last_touch = mta_last(prepared),
+      position_based = mta_position(
+        prepared,
+        first_touch_weight = position_first_touch_weight,
+        last_touch_weight  = position_last_touch_weight
+      )
+    )
+    if (progress_bar) pb$tick()
   }
   
-  return(attribution_results)
+  out
 }
 
 # ------------------------------------------------------------------------------
-# Function: Combine Touchpoint Weights
+# Weight join utility
 # ------------------------------------------------------------------------------
-#' Combine Touchpoint Weights from Multiple Attribution Models
+
+#' Join attribution outputs back to a touchpoint table
 #'
-#' Joins the attribution weights from multiple models to the original touchpoint data.
-#'
-#' @param data A data frame containing touchpoint-level data (must include a 'touchpoint' column).
-#' @param attribution_results A list of attribution model results. Each element should be a data frame
-#'   with at least 'touchpoint' and 'attribution_weight' columns.
-#'
-#' @return A data frame with the original data augmented by attribution weights from each model.
+#' @param data A data.frame containing a `touchpoint` column.
+#' @param attribution_results Named list of model outputs from mta_analysis().
+#' @param weight_prefix Column prefix for weight columns.
+#' @param credit_prefix Column prefix for credit columns.
+#' @return A data.frame augmented with per-model credit and weight columns.
 #' @export
-mta_weights <- function(data, attribution_results) {
-  if (!("touchpoint" %in% colnames(data))) {
-    stop("The input data must have a 'touchpoint' column.")
+mta_weights <- function(
+    data,
+    attribution_results,
+    weight_prefix = "weight_",
+    credit_prefix = "credit_"
+) {
+  if (!is.data.frame(data)) stop("`data` must be a data.frame.")
+  if (!("touchpoint" %in% names(data))) stop("`data` must contain `touchpoint`.")
+  if (!is.list(attribution_results) || length(attribution_results) == 0) {
+    stop("`attribution_results` must be a non-empty list.")
   }
   
-  data_with_weights <- data
+  out <- data
+  out$touchpoint <- as.character(out$touchpoint)
   
   for (model_name in names(attribution_results)) {
     model_df <- attribution_results[[model_name]]
-    if (!("touchpoint" %in% colnames(model_df)) || !("attribution_weight" %in% colnames(model_df))) {
-      stop("Each attribution result must contain 'touchpoint' and 'attribution_weight' columns.")
+    if (!is.data.frame(model_df)) stop("Each model result must be a data.frame.")
+    if (!all(c("touchpoint", "attribution_weight") %in% names(model_df))) {
+      stop("Each model result must contain `touchpoint` and `attribution_weight`.")
     }
     
-    # Add missing touchpoints (if any) with zero conversions and weight
-    missing_touchpoints <- setdiff(unique(data$touchpoint), model_df$touchpoint)
-    if (length(missing_touchpoints) > 0) {
-      missing_df <- data.frame(
-        touchpoint = missing_touchpoints,
-        conversions = 0,
-        attribution_weight = 0,
-        stringsAsFactors = FALSE
-      )
-      model_df <- bind_rows(model_df, missing_df) %>%
-        arrange(touchpoint)
+    credit_col <- if ("conversions" %in% names(model_df)) "conversions" else NULL
+    
+    add <- model_df[, c("touchpoint", credit_col, "attribution_weight"), drop = FALSE]
+    add$touchpoint <- as.character(add$touchpoint)
+    
+    w_name <- paste0(weight_prefix, model_name)
+    names(add)[names(add) == "attribution_weight"] <- w_name
+    
+    if (!is.null(credit_col)) {
+      c_name <- paste0(credit_prefix, model_name)
+      names(add)[names(add) == credit_col] <- c_name
     }
     
-    suffix <- paste0("_", model_name)
-    data_with_weights <- left_join(data_with_weights, model_df, by = "touchpoint", suffix = c("", suffix))
+    out <- merge(out, add, by = "touchpoint", all.x = TRUE, sort = FALSE)
+    
+    out[[w_name]] <- ifelse(is.na(out[[w_name]]), 0, out[[w_name]])
+    if (!is.null(credit_col)) {
+      c_name <- paste0(credit_prefix, model_name)
+      out[[c_name]] <- ifelse(is.na(out[[c_name]]), 0, out[[c_name]])
+    }
   }
   
-  return(data_with_weights)
+  out
 }
 
+# ------------------------------------------------------------------------------
+# UAT script
+# ------------------------------------------------------------------------------
 
-# ===============================
-# UAT Script for Multitouch Attribution Functions
-# ===============================
-
-# --- Load required libraries ---
-library(dplyr)
-library(tidyr)
-library(tidyselect)
-library(progress)
-library(assertthat)
-
-# --- Include the attribution functions ---
-# (Assuming you have already sourced or defined the functions below in your session.)
-# If the functions are saved in a separate file (e.g., "mta_functions.R"), you can do:
-# source("mta_functions.R")
-
-# (Below is the full set of functions from our previous version.)
-# [Paste the complete functions from the previous answer here if not already loaded]
-
-# For clarity, the functions below should already be in your R environment:
-#   mta_validate_data(), mta_rename(), mta_prep(), mta_linear(), 
-#   mta_first(), mta_last(), mta_position(), mta_analysis(), mta_weights()
-
-
-# ===============================
-# UAT: Positive Tests
-# ===============================
-
-cat("\n===== UAT: Positive Tests =====\n\n")
-
-### Test 1: Renaming Columns with mta_rename()
-cat("Test 1: mta_rename()\n")
-# Create sample data with nonstandard column names
-sample_data <- data.frame(
-  cust_id = 1:5,
-  tp = sample(c("A", "B", "C"), 5, replace = TRUE),
-  conv = sample(c(0, 1), 5, replace = TRUE),
-  ts = as.POSIXct(Sys.Date() - sample(0:4, 5, replace = TRUE))
-)
-cat("  Original columns:", paste(colnames(sample_data), collapse = ", "), "\n")
-# Rename columns
-renamed_data <- mta_rename(
-  sample_data,
-  current_names_or_positions = c("cust_id", "tp", "conv", "ts"),
-  new_names = c("customer_id", "touchpoint", "conversion", "timestamp")
-)
-cat("  Renamed columns: ", paste(colnames(renamed_data), collapse = ", "), "\n\n")
-
-
-### Test 2: Data Preparation with mta_prep()
-cat("Test 2: mta_prep()\n")
-prepared_data <- mta_prep(renamed_data)
-if ("touch_rank" %in% colnames(prepared_data)) {
-  cat("  PASS: 'touch_rank' column created.\n")
-} else {
-  cat("  FAIL: 'touch_rank' column is missing.\n")
-}
-cat("  Preview of prepared data:\n")
-print(prepared_data)
-cat("\n")
-
-
-### Test 3: Linear Attribution with mta_linear()
-cat("Test 3: mta_linear()\n")
-linear_result <- mta_linear(prepared_data)
-cat("  Linear attribution result:\n")
-print(linear_result)
-cat("\n")
-
-
-### Test 4: First Touch Attribution with mta_first()
-cat("Test 4: mta_first()\n")
-first_touch_result <- mta_first(prepared_data)
-cat("  First touch attribution result:\n")
-print(first_touch_result)
-cat("\n")
-
-
-### Test 5: Last Touch Attribution with mta_last()
-cat("Test 5: mta_last()\n")
-last_touch_result <- mta_last(prepared_data)
-cat("  Last touch attribution result:\n")
-print(last_touch_result)
-cat("\n")
-
-
-### Test 6: Position-Based Attribution with mta_position()
-cat("Test 6: mta_position()\n")
-position_result <- mta_position(prepared_data)
-cat("  Position-based attribution result:\n")
-print(position_result)
-cat("\n")
-
-
-### Test 7: Wrapper Analysis Function with mta_analysis()
-cat("Test 7: mta_analysis() without progress bar\n")
-analysis_result <- mta_analysis(prepared_data, progress_bar = FALSE)
-cat("  Analysis result (models included):\n")
-print(names(analysis_result))
-cat("\n")
-
-cat("Test 7b: mta_analysis() with progress bar\n")
-analysis_result_pb <- mta_analysis(prepared_data, progress_bar = TRUE)
-cat("  Analysis result (models included):\n")
-print(names(analysis_result_pb))
-cat("\n")
-
-
-### Test 8: Combining Attribution Weights with mta_weights()
-cat("Test 8: mta_weights()\n")
-# Create a sample touchpoint-level summary data frame
-touchpoint_summary <- data.frame(
-  touchpoint = c("A", "B", "C"),
-  some_stat = c(100, 200, 150),
-  stringsAsFactors = FALSE
-)
-combined_weights <- mta_weights(touchpoint_summary, analysis_result)
-cat("  Combined touchpoint weights:\n")
-print(combined_weights)
-cat("\n")
-
-
-# ===============================
-# UAT: Negative Tests (Edge Cases)
-# ===============================
-
-cat("\n===== UAT: Negative Tests =====\n\n")
-
-### Negative Test 1: Empty Data Frame for mta_prep()
-cat("Negative Test 1: mta_prep() with an empty data frame\n")
-empty_data <- data.frame(
-  customer_id = character(),
-  touchpoint = character(),
-  conversion = numeric(),
-  timestamp = as.POSIXct(character())
-)
-empty_prep <- mta_prep(empty_data)
-cat("  Processed empty data; number of rows:", nrow(empty_prep), "\n\n")
-
-
-### Negative Test 2: Missing Required Column in mta_validate_data()
-cat("Negative Test 2: mta_validate_data() with missing required column\n")
-bad_data <- data.frame(
-  customer_id = 1:5,
-  touchpoint = sample(c("A", "B", "C"), 5, replace = TRUE),
-  conversion = sample(c(0, 1), 5, replace = TRUE)
-  # Missing 'timestamp'
-)
-tryCatch({
-  mta_validate_data(bad_data)
-}, error = function(e) {
-  cat("  Expected error encountered: ", e$message, "\n")
-})
-cat("\n")
-
-
-### Negative Test 3: Incorrect Column Names in mta_rename()
-cat("Negative Test 3: mta_rename() with non-existent column name\n")
-tryCatch({
-  mta_rename(
-    sample_data,
-    current_names_or_positions = c("wrong_col", "tp", "conv", "ts"),
-    new_names = c("customer_id", "touchpoint", "conversion", "timestamp")
+# Sample data generator
+mta_uat_data <- function(seed = 1L) {
+  set.seed(seed)
+  
+  customers <- sprintf("C%03d", 1:200)
+  touchpoints <- c("Search", "Social", "Email", "Display", "Affiliate")
+  
+  n_touches <- sample(1:10, length(customers), replace = TRUE)
+  
+  df <- do.call(
+    rbind,
+    lapply(seq_along(customers), function(i) {
+      n <- n_touches[[i]]
+      ts0 <- as.POSIXct("2026-01-01 00:00:00", tz = "UTC") + sample(0:(60 * 60 * 24 * 20), 1)
+      ts <- ts0 + sort(sample(0:(60 * 60 * 24 * 10), n, replace = FALSE))
+      tp <- sample(touchpoints, n, replace = TRUE)
+      
+      conv_flag <- rbinom(1, 1, 0.25)
+      conversion <- integer(n)
+      if (conv_flag == 1L) conversion[n] <- 1L
+      
+      data.frame(
+        customer_id = customers[[i]],
+        touchpoint = tp,
+        conversion = conversion,
+        timestamp = ts,
+        stringsAsFactors = FALSE
+      )
+    })
   )
-}, error = function(e) {
-  cat("  Expected error encountered: ", e$message, "\n")
-})
-cat("\n")
+  
+  df
+}
 
+# UAT runner
+mta_uat_run <- function() {
+  cat("\n===== UAT: Multitouch Attribution =====\n\n")
+  
+  df <- mta_uat_data()
+  
+  cat("Rows:", nrow(df), "\n")
+  cat("Customers:", length(unique(df$customer_id)), "\n\n")
+  
+  prep <- mta_prep(df, conversion_event = "first")
+  cat("Prepared rows:", nrow(prep), "\n")
+  cat("Prepared customers:", length(unique(prep$customer_id)), "\n\n")
+  
+  res <- mta_analysis(
+    prep,
+    progress_bar = FALSE,
+    position_first_touch_weight = 0.4,
+    position_last_touch_weight = 0.4
+  )
+  
+  cat("Models:\n")
+  print(names(res))
+  cat("\n")
+  
+  cat("Linear:\n")
+  print(res$linear[order(-res$linear$attribution_weight), ])
+  cat("\n")
+  
+  cat("First-touch:\n")
+  print(res$first_touch[order(-res$first_touch$attribution_weight), ])
+  cat("\n")
+  
+  cat("Last-touch:\n")
+  print(res$last_touch[order(-res$last_touch$attribution_weight), ])
+  cat("\n")
+  
+  cat("Position-based:\n")
+  print(res$position_based[order(-res$position_based$attribution_weight), ])
+  cat("\n")
+  
+  tp_summary <- data.frame(
+    touchpoint = sort(unique(df$touchpoint)),
+    some_stat = sample(100:500, length(unique(df$touchpoint))),
+    stringsAsFactors = FALSE
+  )
+  
+  joined <- mta_weights(tp_summary, res)
+  
+  cat("Joined weights:\n")
+  print(joined)
+  cat("\n")
+  
+  invisible(list(prepared = prep, results = res, joined = joined))
+}
 
-cat("===== UAT Complete =====\n")
+# Example invocation:
+# mta_uat_run()
