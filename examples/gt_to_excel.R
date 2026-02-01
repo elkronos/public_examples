@@ -1,247 +1,301 @@
-#' Workbook Utilities for Styled Excel Exports
+#' Workbook Utilities for Styled Excel Exports (openxlsx)
 #'
-#' Functions to create and style Excel workbooks using \pkg{openxlsx}, including
-#' worksheet creation with styles, inferred number/date formatting, a summary sheet
-#' with hyperlinks, and a top-level constructor to assemble workbooks from data frames.
+#' Main entry points:
+#' * addStyledTable() — write a data frame to a worksheet with styles and options
+#' * addSummarySheet() — add a summary worksheet with per-sheet row/column counts + hyperlinks
+#' * createStyledWorkbook() — build a complete workbook from main and additional data frames
 #'
-#' @section Main entry points:
-#' * [addStyledTable()] — write a data frame to a worksheet with styles and options
-#' * [addSummarySheet()] — add a summary worksheet with per-sheet row/column counts
-#' * [createStyledWorkbook()] — build a complete workbook from main and additional data frames
-#'
-#' @seealso [openxlsx::createWorkbook()], [openxlsx::addWorksheet()], [openxlsx::writeDataTable()]
 #' @keywords Excel openxlsx export table formatting workbook
-#' @name workbook_utils
 NULL
 
-# ---- Dependencies ----
-#' @import gt
-#' @import openxlsx
-NULL
+# For package code, prefer Imports + openxlsx:: prefixes (no library()).
+# For script usage, load openxlsx externally if desired.
 
-library(gt)
-library(openxlsx)
+# ---- Internal helpers ------------------------------------------------------
 
-# ---- Helpers ---------------------------------------------------------------
-
-#' Validate an openxlsx Workbook object
-#'
-#' @param wb An object expected to be of class `"Workbook"` from \pkg{openxlsx}.
-#' @return Invisibly returns `NULL`. Errors if `wb` is not a workbook.
-#' @keywords internal
-validateWorkbook <- function(wb) {
+.validate_workbook <- function(wb) {
   if (!inherits(wb, "Workbook")) {
-    stop("Invalid workbook object. Must be an object of class 'Workbook' from openxlsx.")
+    stop("Invalid workbook object. Must be an object of class 'Workbook' from openxlsx.", call. = FALSE)
   }
+  invisible(NULL)
 }
 
-#' Sanitize a candidate Excel sheet name
-#'
-#' Ensures the name satisfies Excel constraints (length <= 31, no `: \\ / ? * [ ]`,
-#' no trailing apostrophes, not blank).
-#'
-#' @param x A single character string.
-#' @return A safe sheet name string.
-#' @keywords internal
+.assert_single_string <- function(x, arg = "value") {
+  if (!is.character(x) || length(x) != 1L || !nzchar(trimws(x))) {
+    stop(sprintf("%s must be a single non-empty string.", arg), call. = FALSE)
+  }
+  invisible(NULL)
+}
+
 .sanitize_sheet_name <- function(x) {
-  if (!is.character(x) || length(x) != 1L) stop("sheet_name must be a single string.")
+  .assert_single_string(x, "sheet_name")
   x <- gsub("\\s+", " ", x)
   x <- trimws(x)
   x <- gsub("[:\\\\/\\?\\*\\[\\]]", "_", x, perl = TRUE)
   x <- gsub("[[:cntrl:]]", "", x, perl = TRUE)
   x <- substr(x, 1L, 31L)
   x <- sub("'+$", "", x)
-  if (identical(tolower(x), "history") || x == "") x <- "Sheet"
-  if (!nzchar(gsub("_|\\s", "", x))) x <- "Sheet"
+  if (!nzchar(x) || !nzchar(gsub("_|\\s", "", x))) x <- "Sheet"
   x
 }
 
-#' Ensure a sheet name is unique within a workbook
-#'
-#' Appends suffixes like `" (1)"` if needed, respecting Excel's 31-character limit.
-#'
-#' @param wb A \pkg{openxlsx} `Workbook`.
-#' @param base_name Candidate base name (already sanitized).
-#' @return A unique sheet name.
-#' @keywords internal
+# Generate a unique sheet name while respecting Excel's 31-character limit.
+# Suffix space is reserved so "(n)" can be appended without exceeding the limit.
 .ensure_unique_sheet <- function(wb, base_name) {
-  existing <- sheets(wb)
+  existing <- names(wb)
+  base_name <- substr(base_name, 1L, 31L)
+  
   name <- base_name
   i <- 1L
   while (name %in% existing) {
     suffix <- sprintf(" (%d)", i)
-    name <- substr(paste0(base_name, suffix), 1L, 31L)
+    max_base <- max(1L, 31L - nchar(suffix))
+    name <- paste0(substr(base_name, 1L, max_base), suffix)
     i <- i + 1L
   }
   name
 }
 
-#' Apply inferred numeric/date formats to columns
-#'
-#' Adds a `0.00` numeric format to numeric columns and a `yyyy-mm-dd` format to
-#' `Date`/`POSIXt` columns.
-#'
-#' @param wb A \pkg{openxlsx} `Workbook`.
-#' @param sheet Sheet name.
-#' @param df Data frame written starting at `start_row`.
-#' @param start_row First data row (default `2L`, assuming row 1 is header).
-#' @return Invisibly returns `NULL`.
-#' @keywords internal
-.apply_inferred_formats <- function(wb, sheet, df, start_row = 2L) {
-  is_date <- function(v) inherits(v, c("Date", "POSIXct", "POSIXt"))
-  n <- ncol(df)
-  end_row <- nrow(df) + start_row - 1L
-  if (end_row < start_row) return(invisible(NULL))
-  for (j in seq_len(n)) {
-    col <- df[[j]]
-    if (is.numeric(col)) {
-      addStyle(
-        wb, sheet,
-        style = createStyle(numFmt = "0.00"),
-        rows = start_row:end_row, cols = j,
-        gridExpand = TRUE, stack = TRUE
-      )
-    } else if (is_date(col)) {
-      addStyle(
-        wb, sheet,
-        style = createStyle(numFmt = "yyyy-mm-dd"),
-        rows = start_row:end_row, cols = j,
-        gridExpand = TRUE, stack = TRUE
-      )
-    }
-  }
+.resolve_sheet_name <- function(wb, desired_name) {
+  nm <- .sanitize_sheet_name(desired_name)
+  .ensure_unique_sheet(wb, nm)
+}
+
+.safe_seq_rows <- function(from, to) {
+  if (is.na(from) || is.na(to) || to < from) integer(0) else seq.int(from, to)
+}
+
+# Apply freeze panes relative to the table's header row and start column.
+# When freezing the header only, no columns are frozen.
+.maybe_freeze <- function(wb, sheet, header_row, start_col, freeze_header, freeze_first_col = FALSE) {
+  if (!isTRUE(freeze_header) && !isTRUE(freeze_first_col)) return(invisible(NULL))
+  
+  firstActiveRow <- if (isTRUE(freeze_header)) header_row + 1L else 1L
+  firstActiveCol <- if (isTRUE(freeze_first_col)) start_col + 1L else 1L
+  
+  openxlsx::freezePane(
+    wb, sheet = sheet,
+    firstActiveRow = firstActiveRow,
+    firstActiveCol = firstActiveCol
+  )
   invisible(NULL)
 }
 
-#' Optionally freeze the header row
-#'
-#' @param wb A \pkg{openxlsx} `Workbook`.
-#' @param sheet Sheet name.
-#' @param freeze_header Logical; if `TRUE`, freeze first row.
-#' @return Invisibly returns `NULL`.
-#' @keywords internal
-.maybe_freeze <- function(wb, sheet, freeze_header) {
-  if (isTRUE(freeze_header)) freezePane(wb, sheet = sheet, firstActiveRow = 2, firstActiveCol = 1)
+.set_col_widths <- function(wb, sheet, cols, col_widths) {
+  if (is.null(col_widths)) return(invisible(NULL))
+  if (identical(col_widths, "auto")) {
+    openxlsx::setColWidths(wb, sheet = sheet, cols = cols, widths = "auto")
+    return(invisible(NULL))
+  }
+  openxlsx::setColWidths(wb, sheet = sheet, cols = cols, widths = col_widths)
+  invisible(NULL)
+}
+
+.apply_inferred_formats <- function(wb, sheet, df, data_rows, sheet_cols,
+                                    number_fmt = "0.00",
+                                    date_fmt = "yyyy-mm-dd",
+                                    datetime_fmt = "yyyy-mm-dd hh:mm") {
+  if (length(data_rows) == 0L) return(invisible(NULL))
+  if (!is.data.frame(df) || ncol(df) == 0L) return(invisible(NULL))
+  
+  # Detect column types once
+  is_posix <- vapply(df, function(x) inherits(x, c("POSIXct", "POSIXlt", "POSIXt")), logical(1))
+  is_date  <- vapply(df, function(x) inherits(x, "Date"), logical(1)) & !is_posix
+  is_num   <- vapply(df, is.numeric, logical(1)) & !is_date & !is_posix
+  
+  # Create styles once
+  style_num  <- openxlsx::createStyle(numFmt = number_fmt)
+  style_date <- openxlsx::createStyle(numFmt = date_fmt)
+  style_dt   <- openxlsx::createStyle(numFmt = datetime_fmt)
+  
+  if (any(is_num)) {
+    openxlsx::addStyle(
+      wb, sheet,
+      style = style_num,
+      rows = data_rows,
+      cols = sheet_cols[which(is_num)],
+      gridExpand = TRUE,
+      stack = TRUE
+    )
+  }
+  if (any(is_date)) {
+    openxlsx::addStyle(
+      wb, sheet,
+      style = style_date,
+      rows = data_rows,
+      cols = sheet_cols[which(is_date)],
+      gridExpand = TRUE,
+      stack = TRUE
+    )
+  }
+  if (any(is_posix)) {
+    openxlsx::addStyle(
+      wb, sheet,
+      style = style_dt,
+      rows = data_rows,
+      cols = sheet_cols[which(is_posix)],
+      gridExpand = TRUE,
+      stack = TRUE
+    )
+  }
+  
+  invisible(NULL)
 }
 
 # ---- Public API ------------------------------------------------------------
 
 #' Add a styled table to a worksheet
 #'
-#' Writes a data frame to a new worksheet with optional Excel table styling,
-#' header/cell styling, inferred number/date formats, column widths, and a frozen header row.
+#' @param wb openxlsx Workbook
+#' @param sheet_name Desired sheet name (sanitized + uniquified)
+#' @param data data.frame
+#' @param start_row,start_col Where to write the table (defaults 1,1)
+#' @param overwrite_sheet If TRUE and sheet exists, it will be replaced
+#' @param as_table If TRUE uses writeDataTable; otherwise writeData (still with filters)
+#' @param table_style Excel table style (when as_table = TRUE)
+#' @param header_style,cell_style openxlsx styles
+#' @param apply_header_style,apply_cell_style Whether to apply header/body styles
+#' @param col_widths "auto", numeric vector, or NULL
+#' @param freeze_header Freeze the header row for this table
+#' @param freeze_first_col Freeze the first column (useful for wide tables)
+#' @param apply_inferred_formats Apply number/date/datetime formats inferred from column classes
+#' @param number_fmt,date_fmt,datetime_fmt Formats used when apply_inferred_formats = TRUE
 #'
-#' @param wb An \pkg{openxlsx} `Workbook` object.
-#' @param sheet_name Worksheet name; will be sanitized and uniquified within the workbook.
-#' @param data A data frame to write.
-#' @param table_style Excel table style name (e.g., `"TableStyleMedium9"`). Used when `as_table = TRUE`.
-#' @param header_style An \pkg{openxlsx} style for the header row.
-#' @param cell_style An \pkg{openxlsx} style for data cells.
-#' @param col_widths Numeric vector of widths, `"auto"` for automatic sizing, or `NULL` to skip.
-#' @param apply_header_style Logical; apply `header_style` to the header row.
-#' @param apply_cell_style Logical; apply `cell_style` to data rows.
-#' @param freeze_header Logical; freeze the header row.
-#' @param as_table Logical; write as an Excel table (filters + table style). If `FALSE`, writes plain data with filters.
-#' @param apply_inferred_formats Logical; apply simple numeric/date formats by column.
-#'
-#' @return Invisibly returns the final worksheet name (after sanitization/uniqueness).
-#' @examples
-#' \dontrun{
-#' wb <- openxlsx::createWorkbook()
-#' df <- data.frame(A = 1:3, B = as.Date("2024-01-01") + 0:2)
-#' addStyledTable(wb, "MySheet", df)
-#' openxlsx::saveWorkbook(wb, "example.xlsx", overwrite = TRUE)
-#' }
+#' @return Invisibly returns the final sheet name
 #' @export
 addStyledTable <- function(wb, sheet_name, data,
+                           start_row = 1L,
+                           start_col = 1L,
+                           overwrite_sheet = FALSE,
                            table_style = "TableStyleMedium9",
-                           header_style = createStyle(fontSize = 12, textDecoration = "bold",
-                                                      halign = "center", fgFill = "#DCE6F1",
-                                                      border = "TopBottomLeftRight"),
-                           cell_style = createStyle(halign = "center", border = "TopBottomLeftRight"),
+                           header_style = openxlsx::createStyle(
+                             fontSize = 12, textDecoration = "bold",
+                             halign = "center", fgFill = "#DCE6F1",
+                             border = "TopBottomLeftRight"
+                           ),
+                           cell_style = openxlsx::createStyle(
+                             halign = "center",
+                             border = "TopBottomLeftRight"
+                           ),
                            col_widths = "auto",
                            apply_header_style = TRUE,
                            apply_cell_style = TRUE,
                            freeze_header = TRUE,
+                           freeze_first_col = FALSE,
                            as_table = TRUE,
-                           apply_inferred_formats = TRUE) {
-  validateWorkbook(wb)
-  if (!is.data.frame(data)) stop("data must be a data frame.")
-  if (ncol(data) < 1) stop("data must have at least one column.")
-  if (!is.character(sheet_name) || length(sheet_name) != 1L || !nzchar(trimws(sheet_name))) {
-    stop("sheet_name must be a single string")
+                           apply_inferred_formats = TRUE,
+                           number_fmt = "0.00",
+                           date_fmt = "yyyy-mm-dd",
+                           datetime_fmt = "yyyy-mm-dd hh:mm") {
+  .validate_workbook(wb)
+  if (!is.data.frame(data)) stop("data must be a data frame.", call. = FALSE)
+  if (ncol(data) < 1) stop("data must have at least one column.", call. = FALSE)
+  .assert_single_string(sheet_name, "sheet_name")
+  
+  desired_sanitized <- .sanitize_sheet_name(sheet_name)
+  existing <- names(wb)
+  
+  # Determine final sheet name with overwrite behavior.
+  if (isTRUE(overwrite_sheet) && desired_sanitized %in% existing) {
+    openxlsx::removeWorksheet(wb, desired_sanitized)
+    final_name <- desired_sanitized
+  } else {
+    final_name <- .ensure_unique_sheet(wb, desired_sanitized)
   }
   
-  sheet_name <- .sanitize_sheet_name(sheet_name)
-  sheet_name <- .ensure_unique_sheet(wb, sheet_name)
-  
-  addWorksheet(wb, sheetName = sheet_name)
+  openxlsx::addWorksheet(wb, sheetName = final_name)
   
   if (isTRUE(as_table)) {
-    writeDataTable(wb, sheet = sheet_name, x = data, tableStyle = table_style, withFilter = TRUE)
+    openxlsx::writeDataTable(
+      wb, sheet = final_name, x = data,
+      startRow = start_row, startCol = start_col,
+      tableStyle = table_style, withFilter = TRUE
+    )
   } else {
-    writeData(wb, sheet = sheet_name, x = data, withFilter = TRUE)
+    openxlsx::writeData(
+      wb, sheet = final_name, x = data,
+      startRow = start_row, startCol = start_col,
+      withFilter = TRUE
+    )
   }
+  
+  header_row  <- start_row
+  header_cols <- start_col + seq_len(ncol(data)) - 1L
+  data_rows   <- .safe_seq_rows(start_row + 1L, start_row + nrow(data))
+  sheet_cols  <- header_cols
   
   if (isTRUE(apply_header_style)) {
-    addStyle(wb, sheet = sheet_name, style = header_style, rows = 1, cols = 1:ncol(data), gridExpand = TRUE)
-  }
-  if (isTRUE(apply_cell_style)) {
-    addStyle(wb, sheet = sheet_name, style = cell_style,
-             rows = 2:(nrow(data) + 1), cols = 1:ncol(data), gridExpand = TRUE)
-  }
-  
-  if (isTRUE(apply_inferred_formats) && nrow(data) > 0) {
-    .apply_inferred_formats(wb, sheet_name, data, start_row = 2L)
+    openxlsx::addStyle(
+      wb, sheet = final_name, style = header_style,
+      rows = header_row, cols = header_cols,
+      gridExpand = TRUE, stack = TRUE
+    )
   }
   
-  if (identical(col_widths, "auto")) {
-    setColWidths(wb, sheet = sheet_name, cols = 1:ncol(data), widths = "auto")
-  } else if (!is.null(col_widths)) {
-    setColWidths(wb, sheet = sheet_name, cols = 1:ncol(data), widths = col_widths)
+  if (isTRUE(apply_cell_style) && length(data_rows) > 0L) {
+    openxlsx::addStyle(
+      wb, sheet = final_name, style = cell_style,
+      rows = data_rows, cols = header_cols,
+      gridExpand = TRUE, stack = TRUE
+    )
   }
   
-  .maybe_freeze(wb, sheet_name, freeze_header)
+  if (isTRUE(apply_inferred_formats)) {
+    .apply_inferred_formats(
+      wb, final_name, data,
+      data_rows = data_rows,
+      sheet_cols = sheet_cols,
+      number_fmt = number_fmt,
+      date_fmt = date_fmt,
+      datetime_fmt = datetime_fmt
+    )
+  }
   
-  invisible(sheet_name)
+  .set_col_widths(wb, final_name, cols = header_cols, col_widths = col_widths)
+  .maybe_freeze(
+    wb, final_name,
+    header_row = header_row,
+    start_col = start_col,
+    freeze_header = freeze_header,
+    freeze_first_col = freeze_first_col
+  )
+  
+  invisible(final_name)
 }
 
 #' Add a summary worksheet
 #'
-#' Creates a worksheet summarizing a named list of data frames, including row and column counts,
-#' with hyperlinks to each corresponding sheet in the workbook (if present).
-#'
-#' @param wb An \pkg{openxlsx} `Workbook` object.
-#' @param data_frames A non-empty **named** list of data frames; names are expected to match the target sheet names.
-#' @param summary_sheet_name Name for the summary sheet.
-#' @param table_style Excel table style name for the summary table.
-#' @param header_style An \pkg{openxlsx} style for the header row.
-#' @param col_widths Numeric vector of widths, `"auto"` for automatic sizing, or `NULL` to skip.
-#' @param freeze_header Logical; freeze the header row.
-#'
-#' @return Invisibly returns the created summary sheet name (may differ after uniqueness resolution).
-#' @examples
-#' \dontrun{
-#' wb <- openxlsx::createWorkbook()
-#' addStyledTable(wb, "Sales", data.frame(A=1:3))
-#' addStyledTable(wb, "Costs", data.frame(B=letters[1:4]))
-#' addSummarySheet(wb, list(Sales=data.frame(A=1:3), Costs=data.frame(B=letters[1:4])))
-#' }
+#' @param wb openxlsx Workbook
+#' @param data_frames Named list of data frames (labels for summary)
+#' @param sheet_map Optional named character vector mapping labels -> actual sheet names.
+#'   This is useful when sheet names were sanitized/uniquified.
+#' @param summary_sheet_name Summary sheet name (sanitized + uniquified)
 #' @export
-addSummarySheet <- function(wb, data_frames, summary_sheet_name = "Summary",
+addSummarySheet <- function(wb, data_frames,
+                            sheet_map = NULL,
+                            summary_sheet_name = "Summary",
                             table_style = "TableStyleLight9",
-                            header_style = createStyle(fontSize = 12, textDecoration = "bold",
-                                                       halign = "center", fgFill = "#DCE6F1",
-                                                       border = "TopBottomLeftRight"),
+                            header_style = openxlsx::createStyle(
+                              fontSize = 12, textDecoration = "bold",
+                              halign = "center", fgFill = "#DCE6F1",
+                              border = "TopBottomLeftRight"
+                            ),
+                            link_style = openxlsx::createStyle(
+                              fontColour = "#0563C1",
+                              textDecoration = "underline"
+                            ),
                             col_widths = "auto",
                             freeze_header = TRUE) {
-  validateWorkbook(wb)
-  if (!is.list(data_frames) || length(data_frames) == 0)
-    stop("data_frames must be a non-empty list of data frames.")
-  if (is.null(names(data_frames)) || any(names(data_frames) == ""))
-    stop("data_frames must be a named list (names used as sheet labels).")
+  .validate_workbook(wb)
+  if (!is.list(data_frames) || length(data_frames) == 0L) {
+    stop("data_frames must be a non-empty list of data frames.", call. = FALSE)
+  }
+  if (is.null(names(data_frames)) || any(names(data_frames) == "")) {
+    stop("data_frames must be a named list (names used as labels).", call. = FALSE)
+  }
   
-  ssn <- .ensure_unique_sheet(wb, .sanitize_sheet_name(summary_sheet_name))
+  ssn <- .resolve_sheet_name(wb, summary_sheet_name)
+  openxlsx::addWorksheet(wb, sheetName = ssn)
   
   summaryData <- data.frame(
     Sheet = names(data_frames),
@@ -250,52 +304,59 @@ addSummarySheet <- function(wb, data_frames, summary_sheet_name = "Summary",
     stringsAsFactors = FALSE
   )
   
-  addWorksheet(wb, sheetName = ssn)
-  writeDataTable(wb, sheet = ssn, x = summaryData, tableStyle = table_style, withFilter = TRUE)
-  addStyle(wb, sheet = ssn, style = header_style, rows = 1, cols = 1:ncol(summaryData), gridExpand = TRUE)
+  openxlsx::writeDataTable(
+    wb, sheet = ssn, x = summaryData,
+    tableStyle = table_style, withFilter = TRUE
+  )
+  openxlsx::addStyle(
+    wb, sheet = ssn, style = header_style,
+    rows = 1, cols = 1:ncol(summaryData),
+    gridExpand = TRUE, stack = TRUE
+  )
   
-  available <- sheets(wb)
+  available <- names(wb)
+  
+  # Determine actual targets for each label.
+  resolve_target <- function(label) {
+    if (!is.null(sheet_map) && label %in% names(sheet_map)) return(sheet_map[[label]])
+    if (label %in% available) return(label)
+    s <- .sanitize_sheet_name(label)
+    if (s %in% available) return(s)
+    NA_character_
+  }
+  
   for (i in seq_len(nrow(summaryData))) {
-    target <- summaryData$Sheet[i]
-    if (target %in% available) {
+    label <- summaryData$Sheet[i]
+    target <- resolve_target(label)
+    if (!is.na(target) && target %in% available) {
       safe_target <- gsub("'", "''", target, fixed = TRUE)
-      link_formula <- sprintf('=HYPERLINK("#\'%s\'!A1","%s")', safe_target, target)
-      writeFormula(wb, ssn, x = link_formula, startCol = 1, startRow = i + 1)
+      safe_label  <- gsub("\"", "\"\"", label, fixed = TRUE)
+      link_formula <- sprintf('=HYPERLINK("#\'%s\'!A1","%s")', safe_target, safe_label)
+      openxlsx::writeFormula(wb, ssn, x = link_formula, startCol = 1, startRow = i + 1L)
+      openxlsx::addStyle(wb, ssn, style = link_style, rows = i + 1L, cols = 1, stack = TRUE)
     }
   }
   
-  if (identical(col_widths, "auto")) {
-    setColWidths(wb, sheet = ssn, cols = 1:ncol(summaryData), widths = "auto")
-  } else if (!is.null(col_widths)) {
-    setColWidths(wb, sheet = ssn, cols = 1:ncol(summaryData), widths = col_widths)
-  }
+  .set_col_widths(wb, ssn, cols = 1:ncol(summaryData), col_widths = col_widths)
+  .maybe_freeze(wb, ssn, header_row = 1L, start_col = 1L,
+                freeze_header = freeze_header, freeze_first_col = FALSE)
   
-  .maybe_freeze(wb, ssn, freeze_header)
   invisible(ssn)
 }
 
 #' Create a styled workbook from data frames
 #'
 #' Builds an Excel workbook with a main sheet, optional additional sheets, and
-#' an optional summary sheet. Styling options for each group can be passed as lists.
+#' an optional summary sheet.
 #'
-#' @param main_data Data frame for the main sheet.
-#' @param additional_data_frames Named list of additional data frames.
-#' @param summary_sheet_name Name of the summary sheet.
-#' @param main_sheet_options List of arguments forwarded to [addStyledTable()] for the main sheet.
-#' @param additional_sheet_options List of arguments forwarded to [addStyledTable()] for each additional sheet.
-#' @param summary_sheet_options List of arguments forwarded to [addSummarySheet()].
-#' @param main_sheet_name Name of the main sheet; defaults to `"Sheet1"`.
-#' @param create_summary_if_multiple Logical; if `TRUE`, create a summary when additional sheets are present.
+#' Notes:
+#' - Attaches a 'sheet_map' attribute (label -> actual sheet name) for hyperlink resolution.
+#' - Can include the main sheet in the summary list when requested.
 #'
-#' @return An \pkg{openxlsx} `Workbook` object.
-#' @examples
-#' \dontrun{
-#' main_df <- data.frame(Name = c("John", "Jane"), Age = c(30, 25))
-#' extra <- list(Sheet2 = data.frame(Value = c(1,2,3)))
-#' wb <- createStyledWorkbook(main_df, extra, "Summary")
-#' openxlsx::saveWorkbook(wb, "export.xlsx", overwrite = TRUE)
-#' }
+#' @param main_data data.frame
+#' @param additional_data_frames named list of data.frames
+#' @param include_main_in_summary logical
+#' @return Workbook (with attribute 'sheet_map')
 #' @export
 createStyledWorkbook <- function(main_data,
                                  additional_data_frames = list(),
@@ -304,159 +365,70 @@ createStyledWorkbook <- function(main_data,
                                  additional_sheet_options = list(),
                                  summary_sheet_options = list(),
                                  main_sheet_name = "Sheet1",
-                                 create_summary_if_multiple = TRUE) {
-  if (!is.data.frame(main_data)) stop("main_data must be a data frame.")
-  
-  wb <- createWorkbook()
-  
-  do.call(addStyledTable,
-          c(list(wb = wb, sheet_name = main_sheet_name, data = main_data),
-            main_sheet_options))
-  
-  if (length(additional_data_frames) > 0) {
-    if (is.null(names(additional_data_frames)) || any(names(additional_data_frames) == ""))
-      stop("additional_data_frames must be a named list, where names will be used as sheet names.")
-    for (nm in names(additional_data_frames)) {
-      do.call(addStyledTable,
-              c(list(wb = wb, sheet_name = nm, data = additional_data_frames[[nm]]),
-                additional_sheet_options))
+                                 create_summary_if_multiple = TRUE,
+                                 include_main_in_summary = TRUE) {
+  if (!is.data.frame(main_data)) stop("main_data must be a data frame.", call. = FALSE)
+  if (length(additional_data_frames) > 0L) {
+    if (is.null(names(additional_data_frames)) || any(names(additional_data_frames) == "")) {
+      stop("additional_data_frames must be a named list, where names will be used as sheet labels.", call. = FALSE)
     }
   }
   
-  if (isTRUE(create_summary_if_multiple) && length(additional_data_frames) > 0) {
-    do.call(addSummarySheet,
-            c(list(wb = wb, data_frames = additional_data_frames, summary_sheet_name = summary_sheet_name),
-              summary_sheet_options))
+  wb <- openxlsx::createWorkbook()
+  
+  # Track label -> actual sheet name for hyperlink targets.
+  sheet_map <- character(0)
+  
+  main_actual <- do.call(
+    addStyledTable,
+    c(list(wb = wb, sheet_name = main_sheet_name, data = main_data),
+      main_sheet_options)
+  )
+  sheet_map[main_sheet_name] <- main_actual
+  
+  if (length(additional_data_frames) > 0L) {
+    # Supports either:
+    # - a single option list applied to all additional sheets, OR
+    # - a named list of option lists per sheet label (each element is a list of args).
+    is_per_sheet_opts <- is.list(additional_sheet_options) &&
+      length(additional_sheet_options) > 0L &&
+      !is.null(names(additional_sheet_options)) &&
+      all(nzchar(names(additional_sheet_options))) &&
+      all(vapply(additional_sheet_options, is.list, logical(1)))
+    
+    for (label in names(additional_data_frames)) {
+      opts <- if (is_per_sheet_opts) {
+        if (!is.null(additional_sheet_options[[label]])) additional_sheet_options[[label]] else list()
+      } else {
+        additional_sheet_options
+      }
+      
+      actual <- do.call(
+        addStyledTable,
+        c(list(wb = wb, sheet_name = label, data = additional_data_frames[[label]]),
+          opts)
+      )
+      sheet_map[label] <- actual
+    }
   }
   
-  wb
-}
-
-# ---- Example usage (script) -----------------------------------------------
-
-gt_tbl <- gt(data.frame(Name = c("John", "Jane"), Age = c(30, 25)))
-main_df <- gt_tbl[["_data"]]
-
-other_data_frames <- list(
-  Sheet2 = data.frame(OtherContent = c("Data1", "Data2")),
-  Sheet3 = data.frame(MoreContent = c("Data3", "Data4"))
-)
-
-custom_main_options <- list(
-  table_style = "TableStyleMedium2",
-  header_style = createStyle(fontSize = 14, textDecoration = "bold", halign = "center", fgFill = "#FFFFCC"),
-  cell_style = createStyle(halign = "left", border = "TopBottomLeftRight"),
-  col_widths = "auto",
-  apply_header_style = TRUE,
-  apply_cell_style = TRUE,
-  freeze_header = TRUE,
-  as_table = TRUE,
-  apply_inferred_formats = TRUE
-)
-
-custom_summary_options <- list(
-  table_style = "TableStyleLight1",
-  header_style = createStyle(fontSize = 12, textDecoration = "bold", halign = "center", fgFill = "#CCFFCC"),
-  col_widths = "auto",
-  freeze_header = TRUE
-)
-
-wb <- createStyledWorkbook(main_df, other_data_frames, summary_sheet_name = "Summary",
-                           main_sheet_options = custom_main_options,
-                           summary_sheet_options = custom_summary_options)
-
-saveWorkbook(wb, "output_example.xlsx", overwrite = TRUE)
-
-# ---- User Acceptance Tests (optional) -------------------------------------
-
-if (interactive() || Sys.getenv("RUN_UAT") == "true") {
-  library(testthat)
-  
-  test_that("addStyledTable works with valid inputs and custom options", {
-    wb_test <- createWorkbook()
-    df_test <- data.frame(A = 1:3, B = letters[1:3])
-    expect_silent(addStyledTable(wb_test, "TestSheet", df_test,
-                                 table_style = "TableStyleDark9",
-                                 apply_header_style = TRUE,
-                                 apply_cell_style = TRUE))
-    expect_true("TestSheet" %in% sheets(wb_test))
-  })
-  
-  test_that("addStyledTable uniquifies and sanitizes names", {
-    wb_test <- createWorkbook()
-    df <- data.frame(A=1:2)
-    nm <- "Bad/Name:*?:"
-    addStyledTable(wb_test, nm, df)
-    addStyledTable(wb_test, nm, df)
-    shs <- sheets(wb_test)
-    expect_equal(length(shs), 2L)
-    expect_true(any(grepl("^Bad_Name", shs)))
-  })
-  
-  test_that("addStyledTable can skip cell styling for performance", {
-    wb_test <- createWorkbook()
-    df_test <- data.frame(A = 1:1000, B = rnorm(1000))
-    expect_silent(addStyledTable(wb_test, "BigDataSheet", df_test,
-                                 apply_cell_style = FALSE, as_table = FALSE))
-    expect_true("BigDataSheet" %in% sheets(wb_test))
-  })
-  
-  test_that("addStyledTable errors with non-data.frame input", {
-    wb_test <- createWorkbook()
-    expect_error(addStyledTable(wb_test, "TestSheet", list(a = 1, b = 2)),
-                 "data must be a data frame")
-  })
-  
-  test_that("addStyledTable errors with invalid sheet name", {
-    wb_test <- createWorkbook()
-    df_test <- data.frame(A = 1:3)
-    expect_error(addStyledTable(wb_test, "", df_test),
-                 "sheet_name must be a single string")
-    expect_error(addStyledTable(wb_test, 123, df_test),
-                 "sheet_name must be a single string")
-  })
-  
-  test_that("addSummarySheet works with valid inputs and custom options", {
-    wb_test <- createWorkbook()
-    df1 <- data.frame(X = 1:2)
-    df2 <- data.frame(Y = letters[1:3])
-    additional_list <- list(SheetA = df1, SheetB = df2)
-    expect_silent(addSummarySheet(wb_test, additional_list, "MySummary",
-                                  table_style = "TableStyleLight2"))
-    expect_true("MySummary" %in% sheets(wb_test))
-  })
-  
-  test_that("addSummarySheet errors with invalid data_frames input", {
-    wb_test <- createWorkbook()
-    expect_error(addSummarySheet(wb_test, "not_a_list", "MySummary"),
-                 "data_frames must be a non-empty list")
-  })
-  
-  test_that("createStyledWorkbook works with valid main_data and additional_data_frames with custom options", {
-    main_df <- data.frame(Col1 = c(1, 2))
-    additional_data <- list(
-      Extra1 = data.frame(A = 1:3),
-      Extra2 = data.frame(B = letters[1:2])
+  if (isTRUE(create_summary_if_multiple) && length(additional_data_frames) > 0L) {
+    summary_list <- additional_data_frames
+    if (isTRUE(include_main_in_summary)) {
+      summary_list <- c(setNames(list(main_data), main_sheet_name), summary_list)
+    }
+    
+    do.call(
+      addSummarySheet,
+      c(list(
+        wb = wb,
+        data_frames = summary_list,
+        sheet_map = sheet_map,
+        summary_sheet_name = summary_sheet_name
+      ), summary_sheet_options)
     )
-    wb_new <- createStyledWorkbook(main_df, additional_data, "Summary",
-                                   main_sheet_options = list(table_style = "TableStyleMedium4",
-                                                             apply_cell_style = TRUE),
-                                   additional_sheet_options = list(apply_cell_style = FALSE),
-                                   summary_sheet_options = list(table_style = "TableStyleLight3"))
-    expect_true(all(c("Sheet1","Extra1","Extra2","Summary") %in% sheets(wb_new)))
-  })
+  }
   
-  test_that("createStyledWorkbook errors with invalid main_data", {
-    expect_error(createStyledWorkbook("not_a_dataframe", list()),
-                 "main_data must be a data frame")
-  })
-  
-  test_that("createStyledWorkbook errors with unnamed additional_data_frames", {
-    main_df <- data.frame(Col1 = c(1, 2))
-    unnamed_list <- list(data.frame(A = 1:3))
-    expect_error(createStyledWorkbook(main_df, unnamed_list, "Summary"),
-                 "additional_data_frames must be a named list")
-  })
-  
-  message("All UAT tests passed successfully.")
+  attr(wb, "sheet_map") <- sheet_map
+  wb
 }
