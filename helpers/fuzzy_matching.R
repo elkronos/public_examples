@@ -1,33 +1,61 @@
-# Load required packages for all functions
-library(dplyr)
-library(stringr)
-library(stringdist)
-library(magrittr)
-library(tidyr)
+# ------------------------------------------------------------------------------
+# FUZZY MATCHING WORKFLOW UTILITIES
+# ------------------------------------------------------------------------------
+
+# Notes
+# - These functions support repeatable matching workflows:
+#   1) optional text preprocessing
+#   2) fuzzy matching across one or more metrics
+#   3) optional top-N selection per query & method
+#   4) summary statistics across query-candidate pairs
+# - All functions use explicit namespaces (pkg::fn) so packages do not need to be attached.
+
+# ------------------------------------------------------------------------------
+# DEPENDENCIES
+# ------------------------------------------------------------------------------
+
+#' Ensure required packages are available
+#'
+#' @param pkgs Character vector of package names.
+#' @return Invisibly TRUE if all packages are available.
+ensure_packages <- function(pkgs = c("stringdist", "stringr")) {
+  missing <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(missing) > 0) {
+    stop("Missing required packages: ", paste(missing, collapse = ", "), call. = FALSE)
+  }
+  invisible(TRUE)
+}
 
 # ------------------------------------------------------------------------------
 # TEXT PREPROCESSING
 # ------------------------------------------------------------------------------
 
+#' Escape regex metacharacters in a literal string
+#'
+#' @param x Character vector.
+#' @return Character vector safe for regex patterns.
+escape_regex <- function(x) {
+  stringr::str_replace_all(x, "([\\\\.\\^\\$\\|\\(\\)\\[\\]\\{\\}\\*\\+\\?])", "\\\\\\1")
+}
+
 #' Text Preprocessing
 #'
-#' This function performs preprocessing on a given text column. It can remove specified
-#' strings, remove strings at the beginning or end of text, convert the text to lowercase,
-#' remove punctuation, and strip extra whitespace.
+#' This function performs preprocessing on a given character vector. It can remove
+#' specified strings, remove strings at the beginning or end, convert to lowercase,
+#' remove punctuation, normalize whitespace, and optionally transliterate to ASCII.
 #'
-#' @param text_column A character vector of text data to be preprocessed.
-#' @param remove_strings A character vector of strings to be removed from the text.
-#' @param remove_start A character vector of strings to be removed from the beginning of the text.
-#' @param remove_end A character vector of strings to be removed from the end of the text.
-#' @param to_lowercase A logical value indicating whether to convert the text to lowercase (default: TRUE).
-#' @param remove_punctuation A logical value indicating whether to remove punctuation from the text (default: TRUE).
-#' @param strip_whitespace A logical value indicating whether to strip extra whitespace from the text (default: TRUE).
+#' @param text_column Character vector of text data.
+#' @param remove_strings Character vector of strings/patterns to remove anywhere.
+#' @param remove_start Character vector of strings/patterns to remove from start.
+#' @param remove_end Character vector of strings/patterns to remove from end.
+#' @param to_lowercase Logical; convert to lowercase.
+#' @param remove_punctuation Logical; remove punctuation.
+#' @param strip_whitespace Logical; squish internal whitespace and trim ends.
+#' @param ascii_transliterate Logical; convert accented characters to closest ASCII.
+#' @param pattern_type One of c("fixed","regex"). Controls how remove_* values are interpreted.
+#' @param punctuation_replacement Replacement string for punctuation removal (default "").
 #'
-#' @return A character vector of preprocessed text data.
-#'
-#' @examples
-#' text <- c("  Hello, World!  ", "Goodbye, World!")
-#' text_preprocessing(text, remove_strings = "World")
+#' @return Character vector.
 #'
 #' @export
 text_preprocessing <- function(text_column,
@@ -36,204 +64,423 @@ text_preprocessing <- function(text_column,
                                remove_end = NULL,
                                to_lowercase = TRUE,
                                remove_punctuation = TRUE,
-                               strip_whitespace = TRUE) {
-  if (!is.character(text_column)) {
-    stop("text_column must be a character vector.")
-  }
-  preprocessed_text <- text_column
+                               strip_whitespace = TRUE,
+                               ascii_transliterate = FALSE,
+                               pattern_type = c("fixed", "regex"),
+                               punctuation_replacement = "") {
+  ensure_packages(c("stringr"))
   
-  # Remove specified strings anywhere in the text
-  if (!is.null(remove_strings)) {
-    for (rm_str in remove_strings) {
-      preprocessed_text <- gsub(rm_str, "", preprocessed_text, fixed = TRUE)
+  pattern_type <- match.arg(pattern_type)
+  
+  if (is.factor(text_column)) text_column <- as.character(text_column)
+  if (!is.character(text_column)) stop("text_column must be a character vector.", call. = FALSE)
+  
+  x <- text_column
+  
+  if (ascii_transliterate) {
+    x <- ifelse(is.na(x), NA_character_, iconv(x, from = "", to = "ASCII//TRANSLIT"))
+  }
+  
+  # Remove specified strings/patterns anywhere
+  if (!is.null(remove_strings) && length(remove_strings) > 0) {
+    for (p in remove_strings) {
+      if (pattern_type == "fixed") {
+        x <- stringr::str_replace_all(x, stringr::fixed(p), "")
+      } else {
+        x <- stringr::str_replace_all(x, p, "")
+      }
     }
   }
   
-  # Remove specified strings from the start of the text
-  if (!is.null(remove_start)) {
-    for (start_str in remove_start) {
-      preprocessed_text <- sub(paste0("^", start_str), "", preprocessed_text)
+  # Remove specified strings/patterns at the start
+  if (!is.null(remove_start) && length(remove_start) > 0) {
+    for (p in remove_start) {
+      pat <- if (pattern_type == "fixed") paste0("^", escape_regex(p)) else paste0("^", p)
+      x <- stringr::str_replace(x, pat, "")
     }
   }
   
-  # Remove specified strings from the end of the text
-  if (!is.null(remove_end)) {
-    for (end_str in remove_end) {
-      preprocessed_text <- sub(paste0(end_str, "$"), "", preprocessed_text)
+  # Remove specified strings/patterns at the end
+  if (!is.null(remove_end) && length(remove_end) > 0) {
+    for (p in remove_end) {
+      pat <- if (pattern_type == "fixed") paste0(escape_regex(p), "$") else paste0(p, "$")
+      x <- stringr::str_replace(x, pat, "")
     }
   }
   
-  # Convert to lowercase if requested
-  if (to_lowercase) {
-    preprocessed_text <- tolower(preprocessed_text)
-  }
+  if (to_lowercase) x <- tolower(x)
   
-  # Remove punctuation if requested
   if (remove_punctuation) {
-    preprocessed_text <- gsub("[[:punct:]]", "", preprocessed_text)
+    x <- stringr::str_replace_all(x, "[[:punct:]]+", punctuation_replacement)
   }
   
-  # Strip extra whitespace if requested
   if (strip_whitespace) {
-    preprocessed_text <- gsub("\\s+", " ", preprocessed_text)  # Replace multiple spaces with one
-    preprocessed_text <- trimws(preprocessed_text)             # Remove leading and trailing whitespace
+    x <- stringr::str_squish(x)
   }
   
-  return(preprocessed_text)
+  x
 }
 
 # ------------------------------------------------------------------------------
-# INTERNAL HELPER FUNCTION FOR FUZZY MATCHING
+# METHOD SPECS
 # ------------------------------------------------------------------------------
 
-#' Internal Fuzzy Matching Function
+#' Build method specifications
 #'
-#' This internal helper function computes fuzzy matches for a single query against a
-#' vector of candidate strings using the specified method and threshold.
+#' @param methods Character vector of stringdist methods.
+#' @param thresholds Named list or named numeric vector of thresholds.
+#' @param method_params Named list of per-method parameter lists, passed to stringdist calls.
 #'
-#' For the "jw" (Jaro-Winkler) method, the provided threshold is interpreted as a similarity
-#' threshold (e.g., 0.85) and converted to an allowable distance of 1 - threshold.
-#' For all other methods, the threshold is taken as an absolute distance.
-#'
-#' @param query A single character string representing the query.
-#' @param candidates A character vector of candidate strings.
-#' @param method A character string specifying the distance metric to use.
-#' @param threshold A numeric value specifying the matching threshold.
-#'
-#' @return A character vector of candidate strings that meet the matching criteria.
-fuzzy_match_internal <- function(query, candidates, method, threshold) {
-  # Compute distance matrix: query (length 1) x candidates
-  distances <- stringdist::stringdistmatrix(query, candidates, method = method)
+#' @return Named list where each element contains method, threshold, and params.
+build_method_specs <- function(methods,
+                               thresholds = NULL,
+                               method_params = NULL) {
+  ensure_packages(c("stringdist"))
   
-  # For JW, interpret threshold as similarity and convert it to an allowable distance.
+  valid_methods <- c("jw", "lv", "dl", "hamming", "lcs", "cosine")
+  if (any(!methods %in% valid_methods)) {
+    stop("Invalid method(s): ", paste(setdiff(methods, valid_methods), collapse = ", "),
+         "\nValid methods: ", paste(valid_methods, collapse = ", "), call. = FALSE)
+  }
+  
+  default_thresholds <- list(jw = 0.85, lv = 2, dl = 2, hamming = 2, lcs = 2, cosine = 0.2)
+  
+  if (is.null(thresholds)) thresholds <- default_thresholds
+  if (is.numeric(thresholds)) thresholds <- as.list(thresholds)
+  
+  for (m in methods) {
+    if (is.null(thresholds[[m]])) thresholds[[m]] <- default_thresholds[[m]]
+  }
+  
+  if (is.null(method_params)) method_params <- list()
+  
+  specs <- lapply(methods, function(m) {
+    list(
+      method = m,
+      threshold = thresholds[[m]],
+      params = if (!is.null(method_params[[m]])) method_params[[m]] else list()
+    )
+  })
+  names(specs) <- methods
+  specs
+}
+
+#' Convert a threshold to an allowable distance (used for filtering matches)
+#'
+#' @param method Distance method.
+#' @param threshold Threshold value (jw treated as similarity threshold).
+#' @return Numeric allowable distance.
+threshold_to_allowed_distance <- function(method, threshold) {
+  if (!is.numeric(threshold) || length(threshold) != 1L || is.na(threshold)) {
+    stop("threshold must be a single non-NA numeric value.", call. = FALSE)
+  }
   if (method == "jw") {
-    allowed <- 1 - threshold
-  } else {
-    allowed <- threshold
+    if (threshold < 0 || threshold > 1) {
+      stop("For method 'jw', threshold is a similarity value in [0, 1].", call. = FALSE)
+    }
+    return(1 - threshold)
+  }
+  threshold
+}
+
+# ------------------------------------------------------------------------------
+# INTERNAL MATCHING HELPERS
+# ------------------------------------------------------------------------------
+
+#' Split indices into batches
+#'
+#' @param n Integer size.
+#' @param batch_size Integer batch size, or NULL for a single batch.
+#' @return List of integer index vectors.
+split_indices <- function(n, batch_size = NULL) {
+  if (is.null(batch_size) || batch_size <= 0 || batch_size >= n) {
+    return(list(seq_len(n)))
+  }
+  starts <- seq(1, n, by = batch_size)
+  lapply(starts, function(s) s:min(s + batch_size - 1, n))
+}
+
+#' Compute matches for one method using distance filtering then similarity scoring
+#'
+#' @param queries Character vector (processed).
+#' @param candidates Character vector (processed).
+#' @param spec A single method spec from build_method_specs().
+#' @param query_batch_size Optional integer for batching queries.
+#' @param include_distance Logical; include distance in output.
+#'
+#' @return Data frame with query_index, candidate_index, method, similarity_percentage, distance.
+match_one_method <- function(queries,
+                             candidates,
+                             spec,
+                             query_batch_size = NULL,
+                             include_distance = TRUE) {
+  ensure_packages(c("stringdist"))
+  
+  m <- spec$method
+  thr <- spec$threshold
+  params <- spec$params
+  
+  allowed <- threshold_to_allowed_distance(m, thr)
+  
+  q_batches <- split_indices(length(queries), query_batch_size)
+  out <- vector("list", length(q_batches))
+  out_i <- 0L
+  
+  for (q_idx in q_batches) {
+    q_chunk <- queries[q_idx]
+    
+    dmat <- do.call(
+      stringdist::stringdistmatrix,
+      c(list(a = q_chunk, b = candidates, method = m), params)
+    )
+    
+    hits <- which(!is.na(dmat) & dmat <= allowed, arr.ind = TRUE)
+    if (nrow(hits) == 0) next
+    
+    out_i <- out_i + 1L
+    qi <- q_idx[hits[, 1]]
+    ci <- hits[, 2]
+    
+    sim <- stringdist::stringsim(queries[qi], candidates[ci], method = m) * 100
+    
+    df <- data.frame(
+      query_index = qi,
+      candidate_index = ci,
+      method = m,
+      similarity_percentage = as.numeric(sim),
+      stringsAsFactors = FALSE
+    )
+    
+    if (include_distance) {
+      df$distance <- as.numeric(dmat[cbind(hits[, 1], hits[, 2])])
+    }
+    
+    df$threshold <- thr
+    df$allowed_distance <- allowed
+    
+    out[[out_i]] <- df
   }
   
-  # For methods like "hamming", if lengths differ, stringdist returns NA.
-  matching_indexes <- which(!is.na(distances) & distances <= allowed, arr.ind = TRUE)[, 2]
-  return(candidates[matching_indexes])
+  if (out_i == 0L) return(data.frame())
+  do.call(rbind, out[seq_len(out_i)])
 }
 
 # ------------------------------------------------------------------------------
-# FUZZY MATCHING FUNCTIONS (PER METRIC)
+# PUBLIC FUZZY MATCHING FUNCTIONS
 # ------------------------------------------------------------------------------
 
-#' Fuzzy Match with Jaro-Winkler Distance
+#' Filter candidates for a single query using one method
 #'
-#' @param query A single character string representing the query.
-#' @param candidates A character vector of candidate strings.
-#' @param threshold A numeric value representing the similarity threshold (default: 0.85).
+#' @param query Single character string.
+#' @param candidates Character vector.
+#' @param method One of supported methods.
+#' @param threshold Threshold value.
+#' @param method_params Named list of additional parameters passed to stringdist.
 #'
-#' @return A character vector of candidate strings matching the query.
-#'
-#' @export
-fuzzy_match_jw <- function(query, candidates, threshold = 0.85) {
-  fuzzy_match_internal(query, candidates, method = "jw", threshold = threshold)
+#' @return Character vector of candidate strings that meet the matching criteria.
+fuzzy_match_internal <- function(query, candidates, method, threshold, method_params = list()) {
+  ensure_packages(c("stringdist"))
+  
+  if (is.factor(query)) query <- as.character(query)
+  if (length(query) != 1L || !is.character(query)) stop("query must be a single character string.", call. = FALSE)
+  
+  if (is.factor(candidates)) candidates <- as.character(candidates)
+  if (!is.character(candidates)) stop("candidates must be a character vector.", call. = FALSE)
+  
+  allowed <- threshold_to_allowed_distance(method, threshold)
+  
+  d <- do.call(
+    stringdist::stringdist,
+    c(list(a = query, b = candidates, method = method), method_params)
+  )
+  
+  idx <- which(!is.na(d) & d <= allowed)
+  candidates[idx]
 }
 
-#' Fuzzy Match with Levenshtein Distance
-#'
-#' @param query A single character string representing the query.
-#' @param candidates A character vector of candidate strings.
-#' @param threshold A numeric value representing the maximum edit distance allowed (default: 2).
-#'
-#' @return A character vector of candidate strings matching the query.
-#'
+#' Fuzzy Match with Jaro-Winkler
 #' @export
-fuzzy_match_lv <- function(query, candidates, threshold = 2) {
-  fuzzy_match_internal(query, candidates, method = "lv", threshold = threshold)
+fuzzy_match_jw <- function(query, candidates, threshold = 0.85, method_params = list()) {
+  fuzzy_match_internal(query, candidates, method = "jw", threshold = threshold, method_params = method_params)
 }
 
-#' Fuzzy Match with Damerau-Levenshtein Distance
-#'
-#' @param query A single character string representing the query.
-#' @param candidates A character vector of candidate strings.
-#' @param threshold A numeric value representing the maximum allowed distance (default: 2).
-#'
-#' @return A character vector of candidate strings matching the query.
-#'
+#' Fuzzy Match with Levenshtein
 #' @export
-fuzzy_match_dl <- function(query, candidates, threshold = 2) {
-  fuzzy_match_internal(query, candidates, method = "dl", threshold = threshold)
+fuzzy_match_lv <- function(query, candidates, threshold = 2, method_params = list()) {
+  fuzzy_match_internal(query, candidates, method = "lv", threshold = threshold, method_params = method_params)
 }
 
-#' Fuzzy Match with Hamming Distance
-#'
-#' Note: Hamming distance is only defined for strings of equal length.
-#'
-#' @param query A single character string representing the query.
-#' @param candidates A character vector of candidate strings.
-#' @param threshold A numeric value representing the maximum allowed Hamming distance (default: 2).
-#'
-#' @return A character vector of candidate strings matching the query.
-#'
+#' Fuzzy Match with Damerau-Levenshtein
 #' @export
-fuzzy_match_ham <- function(query, candidates, threshold = 2) {
-  fuzzy_match_internal(query, candidates, method = "hamming", threshold = threshold)
+fuzzy_match_dl <- function(query, candidates, threshold = 2, method_params = list()) {
+  fuzzy_match_internal(query, candidates, method = "dl", threshold = threshold, method_params = method_params)
 }
 
-#' Fuzzy Match with Longest Common Subsequence Distance
-#'
-#' @param query A single character string representing the query.
-#' @param candidates A character vector of candidate strings.
-#' @param threshold A numeric value representing the maximum allowed LCS distance (default: 2).
-#'
-#' @return A character vector of candidate strings matching the query.
-#'
+#' Fuzzy Match with Hamming (equal-length strings)
 #' @export
-fuzzy_match_lcs <- function(query, candidates, threshold = 2) {
-  fuzzy_match_internal(query, candidates, method = "lcs", threshold = threshold)
+fuzzy_match_ham <- function(query, candidates, threshold = 2, method_params = list()) {
+  fuzzy_match_internal(query, candidates, method = "hamming", threshold = threshold, method_params = method_params)
+}
+
+#' Fuzzy Match with Longest Common Subsequence
+#' @export
+fuzzy_match_lcs <- function(query, candidates, threshold = 2, method_params = list()) {
+  fuzzy_match_internal(query, candidates, method = "lcs", threshold = threshold, method_params = method_params)
 }
 
 #' Fuzzy Match with Cosine Distance
-#'
-#' @param query A single character string representing the query.
-#' @param candidates A character vector of candidate strings.
-#' @param threshold A numeric value representing the maximum allowed cosine distance (default: 0.2).
-#'
-#' @return A character vector of candidate strings matching the query.
-#'
 #' @export
-fuzzy_match_cosine <- function(query, candidates, threshold = 0.2) {
-  fuzzy_match_internal(query, candidates, method = "cosine", threshold = threshold)
+fuzzy_match_cosine <- function(query, candidates, threshold = 0.2, method_params = list()) {
+  fuzzy_match_internal(query, candidates, method = "cosine", threshold = threshold, method_params = method_params)
 }
 
 # ------------------------------------------------------------------------------
-# FUZZY MATCHING WRAPPER FUNCTION
+# DATA FRAME MATCHING WRAPPER
 # ------------------------------------------------------------------------------
 
-#' Fuzzy Matching Wrapper Function
+#' Fuzzy matching across data frames
 #'
-#' This function performs fuzzy matching between query and candidate data frames using multiple
-#' distance metrics. It preprocesses the text (if requested), applies the specified matching methods
-#' (with individual thresholds), and returns a data frame of matching results including a similarity
-#' percentage and a match rank (per query & method).
+#' @param query_df Data frame containing query values.
+#' @param candidates_df Data frame containing candidate values.
+#' @param query_col Column name in query_df containing queries.
+#' @param candidates_col Column name in candidates_df containing candidates.
+#' @param query_id_col Optional column name for query identifiers.
+#' @param candidate_id_col Optional column name for candidate identifiers.
+#' @param methods Character vector of methods.
+#' @param thresholds Named list/numeric vector of thresholds per method.
+#' @param method_params Named list of per-method parameter lists for stringdist.
+#' @param preprocess Logical; preprocess query and candidate text.
+#' @param preprocess_params Named list passed to text_preprocessing().
+#' @param keep_original Logical; include original (unprocessed) text columns.
+#' @param top_n Optional integer; keep only top N matches per query & method.
+#' @param include_distance Logical; include distance column.
+#' @param query_batch_size Optional integer; batching for query-side distance calculations.
+#' @param timestamp_fn Function returning a timestamp; default Sys.time().
 #'
-#' @param query_df A data frame containing query strings.
-#' @param candidates_df A data frame containing candidate strings.
-#' @param query_col A character string indicating the column in query_df with query strings.
-#' @param candidates_col A character string indicating the column in candidates_df with candidate strings.
-#' @param methods A character vector of distance metrics to use (default: c("jw", "lv", "dl", "hamming", "lcs", "cosine")).
-#' @param thresholds A named list of thresholds for each method. For example: list(jw = 0.85, lv = 2, dl = 2, hamming = 2, lcs = 2, cosine = 0.2).
-#'                  If not provided, default thresholds are used.
-#' @param preprocess A logical value indicating whether to preprocess text before matching (default: TRUE).
-#' @param top_n An integer value indicating the maximum number of top matching results to return per query per method (default: NULL, meaning no filtering).
-#' @param preprocess_params A named list of additional parameters to pass to text_preprocessing (default: empty list).
-#'
-#' @return A data frame with columns: query, candidate, method, similarity_percentage, date, and match_rank.
-#'
-#' @examples
-#' query_df <- data.frame(id = 1:3, query = c("apple pie", "banana bread", "cherry cobbler"), stringsAsFactors = FALSE)
-#' candidates_df <- data.frame(id = 1:4, candidate = c("apple", "banana", "cherry", "blueberry"), stringsAsFactors = FALSE)
-#' fm <- fuzzy_match_wrapper(query_df, candidates_df, query_col = "query", candidates_col = "candidate",
-#'                           thresholds = list(jw = 0.85, lv = 2, dl = 2, hamming = 2, lcs = 2, cosine = 0.2),
-#'                           preprocess = TRUE, top_n = 2)
-#' print(fm)
-#'
+#' @return Data frame with match results.
 #' @export
+fuzzy_match_df <- function(query_df,
+                           candidates_df,
+                           query_col,
+                           candidates_col,
+                           query_id_col = NULL,
+                           candidate_id_col = NULL,
+                           methods = c("jw", "lv", "dl", "hamming", "lcs", "cosine"),
+                           thresholds = NULL,
+                           method_params = NULL,
+                           preprocess = TRUE,
+                           preprocess_params = list(),
+                           keep_original = TRUE,
+                           top_n = NULL,
+                           include_distance = TRUE,
+                           query_batch_size = NULL,
+                           timestamp_fn = Sys.time) {
+  ensure_packages(c("stringdist", "stringr"))
+  
+  if (!is.data.frame(query_df)) stop("query_df must be a data frame.", call. = FALSE)
+  if (!is.data.frame(candidates_df)) stop("candidates_df must be a data frame.", call. = FALSE)
+  if (!(query_col %in% names(query_df))) stop("query_col not found in query_df.", call. = FALSE)
+  if (!(candidates_col %in% names(candidates_df))) stop("candidates_col not found in candidates_df.", call. = FALSE)
+  
+  if (!is.null(query_id_col) && !(query_id_col %in% names(query_df))) {
+    stop("query_id_col not found in query_df.", call. = FALSE)
+  }
+  if (!is.null(candidate_id_col) && !(candidate_id_col %in% names(candidates_df))) {
+    stop("candidate_id_col not found in candidates_df.", call. = FALSE)
+  }
+  
+  q_raw <- query_df[[query_col]]
+  c_raw <- candidates_df[[candidates_col]]
+  if (is.factor(q_raw)) q_raw <- as.character(q_raw)
+  if (is.factor(c_raw)) c_raw <- as.character(c_raw)
+  
+  if (!is.character(q_raw)) q_raw <- as.character(q_raw)
+  if (!is.character(c_raw)) c_raw <- as.character(c_raw)
+  
+  q_proc <- q_raw
+  c_proc <- c_raw
+  
+  if (preprocess) {
+    q_proc <- do.call(text_preprocessing, c(list(text_column = q_proc), preprocess_params))
+    c_proc <- do.call(text_preprocessing, c(list(text_column = c_proc), preprocess_params))
+  }
+  
+  specs <- build_method_specs(methods = methods, thresholds = thresholds, method_params = method_params)
+  
+  all_results <- vector("list", length(methods))
+  for (k in seq_along(methods)) {
+    m <- methods[k]
+    all_results[[k]] <- match_one_method(
+      queries = q_proc,
+      candidates = c_proc,
+      spec = specs[[m]],
+      query_batch_size = query_batch_size,
+      include_distance = include_distance
+    )
+  }
+  
+  results <- do.call(rbind, all_results)
+  if (is.null(results) || nrow(results) == 0) {
+    return(data.frame())
+  }
+  
+  results$query <- q_proc[results$query_index]
+  results$candidate <- c_proc[results$candidate_index]
+  
+  if (keep_original) {
+    results$query_original <- q_raw[results$query_index]
+    results$candidate_original <- c_raw[results$candidate_index]
+  }
+  
+  if (!is.null(query_id_col)) {
+    results$query_id <- query_df[[query_id_col]][results$query_index]
+  }
+  if (!is.null(candidate_id_col)) {
+    results$candidate_id <- candidates_df[[candidate_id_col]][results$candidate_index]
+  }
+  
+  results$timestamp <- timestamp_fn()
+  
+  key <- paste(results$query_index, results$method, sep = "\u001F")
+  results$match_rank <- ave(
+    results$similarity_percentage,
+    key,
+    FUN = function(x) rank(-x, ties.method = "min")
+  )
+  
+  if (!is.null(top_n)) {
+    if (!is.numeric(top_n) || length(top_n) != 1L || is.na(top_n) || top_n <= 0) {
+      stop("top_n must be a single positive number.", call. = FALSE)
+    }
+    results <- results[results$match_rank <= top_n, , drop = FALSE]
+  }
+  
+  ord_cols <- c(
+    if (!is.null(query_id_col)) "query_id" else NULL,
+    "query",
+    if (keep_original) "query_original" else NULL,
+    if (!is.null(candidate_id_col)) "candidate_id" else NULL,
+    "candidate",
+    if (keep_original) "candidate_original" else NULL,
+    "method",
+    "similarity_percentage",
+    if (include_distance) "distance" else NULL,
+    "threshold",
+    "allowed_distance",
+    "match_rank",
+    "timestamp"
+  )
+  ord_cols <- ord_cols[ord_cols %in% names(results)]
+  
+  results <- results[, ord_cols, drop = FALSE]
+  results <- results[order(results$query, results$method, results$match_rank, -results$similarity_percentage), , drop = FALSE]
+  rownames(results) <- NULL
+  
+  results
+}
+
+# Compatibility wrapper matching the original signature
+# @export
 fuzzy_match_wrapper <- function(query_df, candidates_df,
                                 query_col, candidates_col,
                                 methods = c("jw", "lv", "dl", "hamming", "lcs", "cosine"),
@@ -241,212 +488,215 @@ fuzzy_match_wrapper <- function(query_df, candidates_df,
                                 preprocess = TRUE,
                                 top_n = NULL,
                                 preprocess_params = list()) {
-  # Validate inputs
-  if (!is.data.frame(query_df)) stop("query_df must be a data frame.")
-  if (!is.data.frame(candidates_df)) stop("candidates_df must be a data frame.")
-  if (!(query_col %in% names(query_df))) stop("query_col not found in query_df.")
-  if (!(candidates_col %in% names(candidates_df))) stop("candidates_col not found in candidates_df.")
-  
-  valid_methods <- c("jw", "lv", "dl", "hamming", "lcs", "cosine")
-  if (any(!methods %in% valid_methods)) {
-    stop("Invalid method specified. Valid methods are: ", paste(valid_methods, collapse = ", "))
-  }
-  
-  # Set default thresholds if not provided
-  default_thresholds <- list(jw = 0.85, lv = 2, dl = 2, hamming = 2, lcs = 2, cosine = 0.2)
-  if (is.null(thresholds)) {
-    thresholds <- default_thresholds
-  } else {
-    # For any method not explicitly provided, use the default.
-    for (m in valid_methods) {
-      if (m %in% methods && is.null(thresholds[[m]])) {
-        thresholds[[m]] <- default_thresholds[[m]]
-      }
-    }
-  }
-  
-  # Extract and (optionally) preprocess text columns
-  query_text <- query_df[[query_col]]
-  candidates_text <- candidates_df[[candidates_col]]
-  if (preprocess) {
-    query_text <- do.call(text_preprocessing, c(list(text_column = query_text), preprocess_params))
-    candidates_text <- do.call(text_preprocessing, c(list(text_column = candidates_text), preprocess_params))
-  }
-  
-  # Initialize a list to store results
-  results_list <- list()
-  
-  # Loop over each method and each query value
-  for (m in methods) {
-    method_func <- switch(m,
-                          jw = fuzzy_match_jw,
-                          lv = fuzzy_match_lv,
-                          dl = fuzzy_match_dl,
-                          hamming = fuzzy_match_ham,
-                          lcs = fuzzy_match_lcs,
-                          cosine = fuzzy_match_cosine)
-    for (i in seq_along(query_text)) {
-      q <- query_text[i]
-      # Get matching candidates using the selected method and threshold
-      matches <- method_func(q, candidates_text, threshold = thresholds[[m]])
-      if (length(matches) > 0) {
-        # Calculate similarity percentage using stringsim
-        percentages <- stringdist::stringsim(q, matches, method = m) * 100
-        temp_df <- data.frame(
-          query = q,
-          candidate = matches,
-          method = m,
-          similarity_percentage = percentages,
-          date = Sys.Date(),
-          stringsAsFactors = FALSE
-        )
-        results_list[[length(results_list) + 1]] <- temp_df
-      }
-    }
-  }
-  
-  # Combine all results
-  if (length(results_list) == 0) {
-    results <- data.frame()
-  } else {
-    results <- do.call(rbind, results_list)
-  }
-  
-  # Compute match rank (per query and method) based on similarity_percentage (highest first)
-  if (nrow(results) > 0) {
-    results <- results %>%
-      group_by(query, method) %>%
-      mutate(match_rank = rank(-similarity_percentage, ties.method = "min")) %>%
-      ungroup()
-    
-    # If top_n is specified, filter to keep only the top_n matches per query per method
-    if (!is.null(top_n)) {
-      results <- results %>%
-        group_by(query, method) %>%
-        filter(match_rank <= top_n) %>%
-        ungroup()
-    }
-  }
-  
-  return(results)
+  fuzzy_match_df(
+    query_df = query_df,
+    candidates_df = candidates_df,
+    query_col = query_col,
+    candidates_col = candidates_col,
+    methods = methods,
+    thresholds = thresholds,
+    preprocess = preprocess,
+    preprocess_params = preprocess_params,
+    top_n = top_n,
+    keep_original = TRUE,
+    include_distance = TRUE,
+    query_batch_size = NULL
+  )
 }
 
 # ------------------------------------------------------------------------------
 # CALCULATE STATISTICS OF FUZZY MATCHING
 # ------------------------------------------------------------------------------
 
-#' Calculate Statistics of Fuzzy Matching
+#' Calculate statistics for fuzzy matching output
 #'
-#' This function calculates statistics based on fuzzy matching results. It expects a data frame
-#' (typically produced by fuzzy_match_wrapper) that contains the columns "query", "candidate", and
-#' "similarity_percentage". For each unique query-candidate pair, it computes the number of matches,
-#' the average similarity, and the median similarity.
+#' Expects columns: query, candidate, similarity_percentage.
 #'
-#' @param fuzzy_output A data frame containing fuzzy matching results.
+#' @param fuzzy_output Data frame from fuzzy_match_df() / fuzzy_match_wrapper().
+#' @param group_cols Character vector of column names used for grouping.
+#' @param key_sep Separator used to build grouping keys (non-printing by default).
 #'
-#' @return A data frame with statistics: query, candidate, agreement (number of matches), average similarity,
-#'         and median similarity.
-#'
-#' @examples
-#' # Assuming fm is the output from fuzzy_match_wrapper:
-#' stats <- calculate_stats(fm)
-#' print(stats)
-#'
+#' @return Data frame with agreement, avg_similarity, median_similarity.
 #' @export
-calculate_stats <- function(fuzzy_output) {
+calculate_stats <- function(fuzzy_output,
+                            group_cols = c("query", "candidate"),
+                            key_sep = "\u001F") {
   if (is.null(fuzzy_output) || nrow(fuzzy_output) == 0) {
     warning("Input data frame is empty or NULL.")
     return(NULL)
   }
   
-  required_cols <- c("query", "candidate", "similarity_percentage")
-  if (!all(required_cols %in% colnames(fuzzy_output))) {
-    stop("Input data frame must contain 'query', 'candidate', and 'similarity_percentage' columns.")
+  required_cols <- c(group_cols, "similarity_percentage")
+  missing <- setdiff(required_cols, names(fuzzy_output))
+  if (length(missing) > 0) {
+    stop("Input data frame is missing column(s): ", paste(missing, collapse = ", "), call. = FALSE)
   }
   
-  stats <- fuzzy_output %>%
-    group_by(query, candidate) %>%
-    summarize(agreement = n(),
-              avg_similarity = mean(similarity_percentage, na.rm = TRUE),
-              median_similarity = median(similarity_percentage, na.rm = TRUE),
-              .groups = "drop")
-  return(stats)
+  gdf <- fuzzy_output[group_cols]
+  gdf[] <- lapply(gdf, function(x) {
+    if (is.factor(x)) x <- as.character(x)
+    as.character(x)
+  })
+  
+  key <- do.call(paste, c(gdf, sep = key_sep))
+  sim <- fuzzy_output$similarity_percentage
+  
+  sim_split <- split(sim, key)
+  
+  agreement <- lengths(sim_split)
+  avg_sim <- vapply(sim_split, function(x) mean(x, na.rm = TRUE), numeric(1))
+  med_sim <- vapply(sim_split, function(x) median(x, na.rm = TRUE), numeric(1))
+  
+  groups <- names(sim_split)
+  if (length(groups) == 0) {
+    return(data.frame())
+  }
+  
+  parts <- strsplit(groups, key_sep, fixed = TRUE)
+  group_mat <- do.call(rbind, parts)
+  if (is.null(dim(group_mat))) {
+    group_mat <- matrix(group_mat, nrow = 1)
+  }
+  
+  group_out <- as.data.frame(group_mat, stringsAsFactors = FALSE)
+  names(group_out) <- group_cols
+  
+  out <- data.frame(
+    group_out,
+    agreement = as.integer(agreement),
+    avg_similarity = as.numeric(avg_sim),
+    median_similarity = as.numeric(med_sim),
+    stringsAsFactors = FALSE
+  )
+  
+  rownames(out) <- NULL
+  out
+}
+
+# ------------------------------------------------------------------------------
+# REPEATABLE WORKFLOW WRAPPER
+# ------------------------------------------------------------------------------
+
+#' End-to-end fuzzy matching workflow
+#'
+#' @param query_df Data frame with queries.
+#' @param candidates_df Data frame with candidates.
+#' @param query_col Query column name.
+#' @param candidates_col Candidate column name.
+#' @param ... Additional parameters forwarded to fuzzy_match_df().
+#'
+#' @return List with matches, stats, and inputs metadata.
+#' @export
+run_fuzzy_workflow <- function(query_df,
+                               candidates_df,
+                               query_col,
+                               candidates_col,
+                               ...) {
+  matches <- fuzzy_match_df(
+    query_df = query_df,
+    candidates_df = candidates_df,
+    query_col = query_col,
+    candidates_col = candidates_col,
+    ...
+  )
+  
+  stats <- calculate_stats(matches)
+  
+  list(
+    matches = matches,
+    stats = stats,
+    meta = list(
+      query_n = nrow(query_df),
+      candidate_n = nrow(candidates_df),
+      query_col = query_col,
+      candidates_col = candidates_col
+    )
+  )
 }
 
 # ------------------------------------------------------------------------------
 # USER ACCEPTANCE TESTING (UAT)
 # ------------------------------------------------------------------------------
 
-if (interactive() || Sys.getenv("UAT_RUN") == "TRUE") {
-  
+run_uat <- function() {
   cat("\n====================\n")
   cat("UAT: text_preprocessing\n")
   cat("====================\n")
   test_text <- c("  Hello, World!  ", "Goodbye, World!")
   cat("Original text:\n")
   print(test_text)
-  preprocessed <- text_preprocessing(test_text,
-                                     remove_strings = "World",
-                                     remove_start = "  ",
-                                     remove_end = "  ",
-                                     to_lowercase = TRUE,
-                                     remove_punctuation = TRUE,
-                                     strip_whitespace = TRUE)
+  preprocessed <- text_preprocessing(
+    test_text,
+    remove_strings = "World",
+    to_lowercase = TRUE,
+    remove_punctuation = TRUE,
+    strip_whitespace = TRUE,
+    pattern_type = "fixed"
+  )
   cat("Preprocessed text:\n")
   print(preprocessed)
   
   cat("\n====================\n")
-  cat("UAT: Fuzzy Matching Functions\n")
+  cat("UAT: Single-query match helpers\n")
   cat("====================\n")
   query <- "apple"
   candidates <- c("apple", "apples", "banana", "pineapple", "aple")
   
-  cat("\nJaro-Winkler Matching (threshold = 0.85):\n")
+  cat("\nJaro-Winkler (threshold = 0.85):\n")
   print(fuzzy_match_jw(query, candidates, threshold = 0.85))
   
-  cat("\nLevenshtein Matching (threshold = 2):\n")
+  cat("\nLevenshtein (threshold = 2):\n")
   print(fuzzy_match_lv(query, candidates, threshold = 2))
   
-  cat("\nDamerau-Levenshtein Matching (threshold = 2):\n")
+  cat("\nDamerau-Levenshtein (threshold = 2):\n")
   print(fuzzy_match_dl(query, candidates, threshold = 2))
   
-  # For Hamming, only use candidates of equal length as the query.
-  cat("\nHamming Matching (threshold = 1) [only equal-length candidates]:\n")
+  cat("\nHamming (threshold = 1) [equal-length candidates]:\n")
   ham_candidates <- c("apple", "appla", "aplex", "app")
   print(fuzzy_match_ham(query, ham_candidates, threshold = 1))
   
-  cat("\nLongest Common Subsequence Matching (threshold = 2):\n")
+  cat("\nLCS (threshold = 2):\n")
   print(fuzzy_match_lcs(query, candidates, threshold = 2))
   
-  cat("\nCosine Matching (threshold = 0.2):\n")
+  cat("\nCosine (threshold = 0.2):\n")
   print(fuzzy_match_cosine(query, candidates, threshold = 0.2))
   
   cat("\n====================\n")
-  cat("UAT: fuzzy_match_wrapper\n")
+  cat("UAT: Data frame wrapper + stats\n")
   cat("====================\n")
-  query_df <- data.frame(id = 1:3,
-                         query = c("apple pie", "banana bread", "cherry cobbler"),
-                         stringsAsFactors = FALSE)
-  candidates_df <- data.frame(id = 1:4,
-                              candidate = c("apple", "banana", "cherry", "blueberry"),
-                              stringsAsFactors = FALSE)
+  query_df <- data.frame(
+    id = 1:3,
+    query = c("apple pie", "banana bread", "cherry cobbler"),
+    stringsAsFactors = FALSE
+  )
+  candidates_df <- data.frame(
+    id = 1:4,
+    candidate = c("apple", "banana", "cherry", "blueberry"),
+    stringsAsFactors = FALSE
+  )
   
-  # You can pass extra parameters to text_preprocessing via preprocess_params if desired.
-  fm_results <- fuzzy_match_wrapper(query_df, candidates_df,
-                                    query_col = "query",
-                                    candidates_col = "candidate",
-                                    methods = c("jw", "lv", "dl", "hamming", "lcs", "cosine"),
-                                    thresholds = list(jw = 0.85, lv = 2, dl = 2, hamming = 2, lcs = 2, cosine = 0.2),
-                                    preprocess = TRUE,
-                                    top_n = 2,
-                                    preprocess_params = list(to_lowercase = TRUE, remove_punctuation = TRUE, strip_whitespace = TRUE))
-  cat("Fuzzy Match Wrapper Results:\n")
-  print(fm_results)
+  workflow <- run_fuzzy_workflow(
+    query_df = query_df,
+    candidates_df = candidates_df,
+    query_col = "query",
+    candidates_col = "candidate",
+    query_id_col = "id",
+    candidate_id_col = "id",
+    methods = c("jw", "lv", "dl", "hamming", "lcs", "cosine"),
+    thresholds = list(jw = 0.85, lv = 2, dl = 2, hamming = 2, lcs = 2, cosine = 0.2),
+    preprocess = TRUE,
+    preprocess_params = list(to_lowercase = TRUE, remove_punctuation = TRUE, strip_whitespace = TRUE),
+    top_n = 2,
+    query_batch_size = NULL
+  )
   
-  cat("\n====================\n")
-  cat("UAT: calculate_stats\n")
-  cat("====================\n")
-  stats <- calculate_stats(fm_results)
-  cat("Calculated Statistics:\n")
-  print(stats)
+  cat("Matches:\n")
+  print(workflow$matches)
+  cat("\nStats:\n")
+  print(workflow$stats)
+  
+  invisible(workflow)
 }
+
+# Uncomment to run
+# run_uat()
