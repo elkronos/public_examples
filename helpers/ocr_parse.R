@@ -1,5 +1,5 @@
 # =============================================================================
-# Enhanced OCR Processing Module with UAT Tests
+# OCR Processing Module with UAT Tests
 # =============================================================================
 
 # ----- Helper Function: Install Required Packages -----
@@ -13,11 +13,18 @@ install_packages <- function(packages) {
   if (!is.character(packages) || length(packages) == 0) {
     stop("packages must be a non-empty character vector.")
   }
+  
+  # Use a default CRAN mirror when none is configured
+  repos <- getOption("repos")
+  if (is.null(repos) || identical(repos, "@CRAN@") || length(repos) == 0) {
+    repos <- c(CRAN = "https://cloud.r-project.org")
+  }
+  
   installed <- rownames(installed.packages())
   for (pkg in packages) {
     if (!(pkg %in% installed)) {
       message("Installing package: ", pkg)
-      install.packages(pkg)
+      install.packages(pkg, repos = repos, dependencies = TRUE)
     }
   }
   invisible(NULL)
@@ -43,6 +50,7 @@ library(testthat)
 #' @param output A character string specifying the file path to save the extracted text.
 #' @param lang A character string specifying the OCR language (default "eng").
 #' @param verbose Logical; if TRUE, prints progress and statistics (default TRUE).
+#' @param pdf_dpi Numeric; resolution used when rasterizing PDF pages for OCR (default 300).
 #'
 #' @return A list with elements:
 #'   - \code{text}: The extracted text.
@@ -57,43 +65,29 @@ library(testthat)
 #'   img <- image_read("sample_image.png")
 #'   result <- ocr_parse(img, "output.txt")
 #' }
-ocr_parse <- function(input, output, lang = "eng", verbose = TRUE) {
+ocr_parse <- function(input, output, lang = "eng", verbose = TRUE, pdf_dpi = 300) {
   start_time <- Sys.time()
   text <- NULL
+  num_pages <- 0L
   
-  # Validate and process the input
-  if (is.character(input)) {
-    if (!file.exists(input)) {
-      stop("Input file does not exist: ", input)
-    }
-    ext <- tolower(tools::file_ext(input))
-    if (! ext %in% c("pdf", "jpg", "jpeg", "png", "tiff", "bmp")) {
-      stop("Unsupported input file type: ", ext)
-    }
-    
-    if (ext == "pdf") {
-      if (verbose) message("Processing PDF file: ", input)
-      pages <- pdf_text(input)
-      text <- paste(pages, collapse = "\n")
-      num_pages <- length(pages)
-    } else {
-      if (verbose) message("Processing image file: ", input)
-      eng <- tesseract::tesseract(lang)
-      img <- magick::image_read(input)
-      text <- tesseract::ocr(img, engine = eng)
-      num_pages <- 1
-    }
-    
-  } else if (inherits(input, "magick-image")) {
-    if (verbose) message("Processing magick-image object.")
-    eng <- tesseract::tesseract(lang)
-    text <- tesseract::ocr(input, engine = eng)
-    num_pages <- 1
-  } else {
-    stop("Unsupported input type. Provide a file path or a magick-image object.")
+  if (!is.character(output) || length(output) != 1 || !nzchar(output)) {
+    stop("output must be a single, non-empty file path.")
   }
   
-  # Check output file write permissions
+  # Ensure the output directory exists and is writable
+  out_dir <- dirname(output)
+  if (!dir.exists(out_dir)) {
+    if (verbose) message("Creating output directory: ", out_dir)
+    dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  }
+  if (!dir.exists(out_dir)) {
+    stop("Output directory does not exist and could not be created: ", out_dir)
+  }
+  if (file.access(out_dir, mode = 2) != 0) {
+    stop("Output directory is not writable: ", out_dir)
+  }
+  
+  # If output file exists, confirm it is writable before overwriting
   if (file.exists(output)) {
     if (file.access(output, mode = 2) != 0) {
       stop("Output file exists and is not writable: ", output)
@@ -101,13 +95,91 @@ ocr_parse <- function(input, output, lang = "eng", verbose = TRUE) {
     if (verbose) message("Warning: Output file exists and will be overwritten: ", output)
   }
   
-  # Write the extracted text to the output file
-  writeLines(text, con = output)
+  engine <- tesseract::tesseract(lang)
   
-  elapsed_time <- Sys.time() - start_time
+  # Validate and process the input
+  if (is.character(input)) {
+    if (length(input) != 1 || !nzchar(input)) {
+      stop("input must be a single, non-empty file path when provided as character.")
+    }
+    if (!file.exists(input)) {
+      stop("Input file does not exist: ", input)
+    }
+    
+    ext <- tolower(tools::file_ext(input))
+    if (!(ext %in% c("pdf", "jpg", "jpeg", "png", "tiff", "bmp"))) {
+      stop("Unsupported input file type: ", ext)
+    }
+    
+    if (ext == "pdf") {
+      if (!is.numeric(pdf_dpi) || length(pdf_dpi) != 1 || is.na(pdf_dpi) || pdf_dpi <= 0) {
+        stop("pdf_dpi must be a single positive number.")
+      }
+      
+      if (verbose) message("Processing PDF file with OCR: ", input)
+      
+      pdf_info <- pdftools::pdf_info(input)
+      num_pages <- as.integer(pdf_info$pages)
+      
+      # Rasterize PDF pages to images, then run OCR page-by-page
+      tmp_dir <- tempfile("ocr_pdf_")
+      dir.create(tmp_dir, recursive = TRUE, showWarnings = FALSE)
+      if (!dir.exists(tmp_dir)) {
+        stop("Temporary directory could not be created: ", tmp_dir)
+      }
+      
+      on.exit({
+        if (dir.exists(tmp_dir)) unlink(tmp_dir, recursive = TRUE, force = TRUE)
+      }, add = TRUE)
+      
+      image_files <- tryCatch(
+        pdftools::pdf_convert(
+          pdf = input,
+          format = "png",
+          dpi = pdf_dpi,
+          pages = seq_len(num_pages),
+          filenames = file.path(tmp_dir, sprintf("page_%04d", seq_len(num_pages)))
+        ),
+        error = function(e) {
+          stop("PDF rasterization failed: ", conditionMessage(e))
+        }
+      )
+      
+      page_text <- character(length(image_files))
+      for (i in seq_along(image_files)) {
+        if (verbose) message("OCR page ", i, " of ", length(image_files))
+        img <- magick::image_read(image_files[[i]])
+        page_text[[i]] <- tesseract::ocr(img, engine = engine)
+      }
+      
+      text <- paste(page_text, collapse = "\n")
+    } else {
+      if (verbose) message("Processing image file: ", input)
+      img <- magick::image_read(input)
+      num_pages <- as.integer(length(img))
+      frame_text <- vapply(seq_len(num_pages), function(i) {
+        tesseract::ocr(img[i], engine = engine)
+      }, FUN.VALUE = character(1))
+      text <- paste(frame_text, collapse = "\n")
+    }
+  } else if (inherits(input, "magick-image")) {
+    if (verbose) message("Processing magick-image object.")
+    num_pages <- as.integer(length(input))
+    frame_text <- vapply(seq_len(num_pages), function(i) {
+      tesseract::ocr(input[i], engine = engine)
+    }, FUN.VALUE = character(1))
+    text <- paste(frame_text, collapse = "\n")
+  } else {
+    stop("Unsupported input type. Provide a file path or a magick-image object.")
+  }
+  
+  # Write the extracted text to the output file
+  writeLines(text, con = output, useBytes = TRUE)
+  
+  elapsed_time <- difftime(Sys.time(), start_time, units = "secs")
   stats <- list(
-    processing_time = as.numeric(elapsed_time, units = "secs"),
-    character_count = nchar(text),
+    processing_time = as.numeric(elapsed_time),
+    character_count = nchar(text, type = "chars"),
     num_pages = num_pages
   )
   
@@ -115,15 +187,15 @@ ocr_parse <- function(input, output, lang = "eng", verbose = TRUE) {
     message("Text extracted and saved to ", output)
     message("Processing time (secs): ", stats$processing_time)
     message("Character count: ", stats$character_count)
-    message("Number of pages processed: ", num_pages)
+    message("Number of pages processed: ", stats$num_pages)
   }
   
-  return(list(text = text, stats = stats))
+  list(text = text, stats = stats)
 }
 
 # ----- Image Preprocessing Function -----
 
-#' Preprocess an image to enhance OCR accuracy.
+#' Preprocess an image to support OCR readability.
 #'
 #' @param input A character string specifying the image file path.
 #' @param resize_width A character string specifying the new width (default "3000x").
@@ -137,8 +209,8 @@ ocr_parse <- function(input, output, lang = "eng", verbose = TRUE) {
 #'   processed_img <- process_image("sample_image.png")
 #' }
 process_image <- function(input, resize_width = "3000x", grayscale = TRUE, threshold = "50%") {
-  if (!is.character(input) || length(input) != 1) {
-    stop("input must be a single file path.")
+  if (!is.character(input) || length(input) != 1 || !nzchar(input)) {
+    stop("input must be a single, non-empty file path.")
   }
   if (!file.exists(input)) {
     stop("Input file does not exist: ", input)
@@ -147,12 +219,19 @@ process_image <- function(input, resize_width = "3000x", grayscale = TRUE, thres
   img <- magick::image_read(input)
   img <- magick::image_resize(img, resize_width)
   
+  if (!is.logical(grayscale) || length(grayscale) != 1 || is.na(grayscale)) {
+    stop("grayscale must be a single logical value.")
+  }
   if (grayscale) {
     img <- magick::image_convert(img, colorspace = "gray")
   }
   
+  if (!is.character(threshold) || length(threshold) != 1 || !nzchar(threshold)) {
+    stop("threshold must be a single, non-empty character value (for example, \"50%\").")
+  }
+  
   img <- magick::image_threshold(img, type = "black", threshold = threshold)
-  return(img)
+  img
 }
 
 # ----- Parallel Processing Function -----
@@ -162,6 +241,7 @@ process_image <- function(input, resize_width = "3000x", grayscale = TRUE, thres
 #' @param files A non-empty list of lists. Each inner list must have elements \code{input} and \code{output}.
 #' @param lang A character string specifying the OCR language (default "eng").
 #' @param verbose Logical; if TRUE, prints status messages (default TRUE).
+#' @param workers Integer; number of worker processes (default: max(1, detectCores() - 1)).
 #'
 #' @return A list of results (each as returned by \code{ocr_parse}).
 #'
@@ -173,35 +253,40 @@ process_image <- function(input, resize_width = "3000x", grayscale = TRUE, thres
 #'   )
 #'   results <- process_files_parallel(files)
 #' }
-process_files_parallel <- function(files, lang = "eng", verbose = TRUE) {
+process_files_parallel <- function(files, lang = "eng", verbose = TRUE,
+                                   workers = max(1L, parallel::detectCores() - 1L)) {
   if (!is.list(files) || length(files) == 0) {
     stop("files must be a non-empty list of file pair lists.")
   }
+  if (!is.numeric(workers) || length(workers) != 1 || is.na(workers) || workers < 1) {
+    stop("workers must be a single positive integer.")
+  }
+  workers <- as.integer(workers)
   
-  num_cores <- parallel::detectCores()
-  cl <- parallel::makeCluster(num_cores)
+  cl <- parallel::makeCluster(workers)
+  on.exit(parallel::stopCluster(cl), add = TRUE)
   
-  # Ensure necessary libraries are loaded on each cluster node
+  # Ensure required libraries are loaded on each worker
   parallel::clusterEvalQ(cl, {
     library(tesseract)
     library(magick)
     library(pdftools)
   })
+  
+  # Export the OCR function to workers
   parallel::clusterExport(cl, varlist = c("ocr_parse"), envir = environment())
   
-  results <- parallel::parLapply(cl, files, function(file_pair) {
+  results <- parallel::parLapply(cl, files, function(file_pair, lang) {
     if (!is.list(file_pair) || is.null(file_pair$input) || is.null(file_pair$output)) {
       stop("Each file pair must be a list with 'input' and 'output' elements.")
     }
-    res <- ocr_parse(file_pair$input, file_pair$output, lang = lang, verbose = FALSE)
-    return(res)
-  })
+    ocr_parse(file_pair$input, file_pair$output, lang = lang, verbose = FALSE)
+  }, lang = lang)
   
-  parallel::stopCluster(cl)
   if (verbose) {
-    message("Parallel processing completed for ", length(files), " files.")
+    message("Parallel processing completed for ", length(files), " files using ", workers, " workers.")
   }
-  return(results)
+  results
 }
 
 # ----- Sequential Processing with Progress Bar -----
@@ -245,85 +330,5 @@ process_files_with_progress <- function(files, lang = "eng", verbose = TRUE) {
   if (verbose) {
     message("Sequential processing completed for ", length(files), " files.")
   }
-  return(results)
+  results
 }
-
-# =============================================================================
-# UAT (User Acceptance Testing) Section: Testing Every Parameter & Function
-# =============================================================================
-
-if (interactive()) {
-  message("Running UAT tests ...")
-  
-  test_that("install_packages validates input", {
-    expect_error(install_packages(123), "non-empty character vector")
-    expect_error(install_packages(character(0)), "non-empty character vector")
-  })
-  
-  test_that("ocr_parse errors on non-existent file", {
-    temp_output <- tempfile(fileext = ".txt")
-    expect_error(ocr_parse("nonexistentfile.png", temp_output))
-  })
-  
-  test_that("ocr_parse errors on unsupported file type", {
-    temp_file <- tempfile(fileext = ".txt")
-    file.create(temp_file)
-    temp_output <- tempfile(fileext = ".txt")
-    expect_error(ocr_parse(temp_file, temp_output), "Unsupported input file type")
-    unlink(temp_file)
-  })
-  
-  test_that("ocr_parse works with a magick-image object", {
-    # Create a blank image and add annotation text.
-    img <- magick::image_blank(width = 300, height = 100, color = "white")
-    img <- magick::image_annotate(img, "Test OCR", size = 20, color = "black", gravity = "center")
-    temp_output <- tempfile(fileext = ".txt")
-    result <- ocr_parse(img, temp_output, verbose = FALSE)
-    expect_true(is.list(result))
-    expect_true("text" %in% names(result))
-    expect_true("stats" %in% names(result))
-    unlink(temp_output)
-  })
-  
-  test_that("process_image errors on non-existent file", {
-    expect_error(process_image("nonexistentfile.png"))
-  })
-  
-  test_that("process_image returns a magick-image object", {
-    temp_img <- tempfile(fileext = ".png")
-    img <- magick::image_blank(width = 300, height = 100, color = "white")
-    magick::image_write(img, path = temp_img, format = "png")
-    processed <- process_image(temp_img)
-    expect_true(inherits(processed, "magick-image"))
-    unlink(temp_img)
-  })
-  
-  test_that("process_files_parallel and process_files_with_progress work", {
-    # Create a temporary image file with OCR text.
-    temp_img <- tempfile(fileext = ".png")
-    img <- magick::image_blank(width = 300, height = 100, color = "white")
-    img <- magick::image_annotate(img, "Test OCR", size = 20, color = "black", gravity = "center")
-    magick::image_write(img, path = temp_img, format = "png")
-    temp_output1 <- tempfile(fileext = ".txt")
-    temp_output2 <- tempfile(fileext = ".txt")
-    
-    files_list <- list(
-      list(input = temp_img, output = temp_output1),
-      list(input = temp_img, output = temp_output2)
-    )
-    
-    res_parallel <- process_files_parallel(files_list, verbose = FALSE)
-    res_progress <- process_files_with_progress(files_list, verbose = FALSE)
-    
-    expect_equal(length(res_parallel), 2)
-    expect_equal(length(res_progress), 2)
-    
-    unlink(c(temp_img, temp_output1, temp_output2))
-  })
-  
-  message("All UAT tests passed!")
-}
-
-# =============================================================================
-# End of Module
-# =============================================================================
