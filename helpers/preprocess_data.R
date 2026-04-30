@@ -77,7 +77,7 @@ with_default_contrasts <- function(expr) {
 parse_date_best_effort <- function(x) {
   if (inherits(x, c("Date", "POSIXct", "POSIXt"))) return(as.POSIXct(x))
   if (is.numeric(x)) {
-    if (all(is.finite(x), na.rm = TRUE) && median(x, na.rm = TRUE) > 1e8) {
+    if (all(is.na(x) | is.finite(x)) && median(x, na.rm = TRUE) > 1e8) {
       return(as.POSIXct(x, origin = "1970-01-01", tz = "UTC"))
     }
     return(as.POSIXct(rep(NA, length(x)), origin = "1970-01-01", tz = "UTC"))
@@ -156,7 +156,10 @@ remove_constant_columns <- function(data, tol_var = 1e-8) {
   list(new_data = data[, keep, drop = FALSE], removed = removed)
 }
 
-# Reinserts only numeric constants; constant categorical columns are intentionally not reintroduced
+# Reinserts constant columns (numeric, factor, and logical) captured at fit time.
+# This keeps the schema symmetric: any column dropped by remove_constant_columns
+# is restored downstream with the same name, storage type, and (for factors) the
+# original levels, so consumers that still expect the column see it.
 reinsert_constant_columns <- function(data, removed) {
   assert_df(data, "data")
   if (!length(removed)) return(data)
@@ -166,6 +169,11 @@ reinsert_constant_columns <- function(data, removed) {
     meta <- removed[[col]]
     if (identical(meta$type, "numeric")) {
       data[[col]] <- rep(meta$value, n)
+    } else if (identical(meta$type, "factor")) {
+      lvls <- meta$levels %||% as.character(meta$value)
+      data[[col]] <- factor(rep(as.character(meta$value), n), levels = lvls)
+    } else if (identical(meta$type, "logical")) {
+      data[[col]] <- rep(as.logical(meta$value), n)
     }
   }
   data
@@ -198,19 +206,22 @@ apply_imputer_model <- function(data, model) {
   assert_df(data, "data")
   for (col in names(model)) {
     if (!col %in% names(data)) next
-    if (!anyNA(data[[col]])) next
     
     m <- model[[col]]
-    if (m$type == "numeric") {
-      if (!is.numeric(data[[col]])) data[[col]] <- suppressWarnings(as.numeric(data[[col]]))
-      data[[col]][is.na(data[[col]])] <- m$value
-    } else if (m$type == "factor") {
+    if (m$type == "factor") {
       x <- data[[col]]
       if (!is.factor(x)) x <- factor(as.character(x), levels = m$levels)
       xc <- as.character(x)
       xc[!(xc %in% m$levels)] <- NA
-      xc[is.na(xc)] <- m$value
+      if (anyNA(xc)) xc[is.na(xc)] <- m$value
       data[[col]] <- factor(xc, levels = m$levels)
+      next
+    }
+    if (!anyNA(data[[col]])) next   # short-circuit only the numeric/logical path
+    
+    if (m$type == "numeric") {
+      if (!is.numeric(data[[col]])) data[[col]] <- suppressWarnings(as.numeric(data[[col]]))
+      data[[col]][is.na(data[[col]])] <- m$value
     } else if (m$type == "logical") {
       x <- data[[col]]
       if (!is.logical(x)) x <- as.logical(x)
@@ -232,7 +243,7 @@ impute_missing_data <- function(data,
                                 numeric_method = "pmm",
                                 binary_factor_method = "logreg",
                                 multiclass_factor_method = "polyreg",
-                                m = 5,
+                                m = 1,
                                 maxit = 20,
                                 seed = 500,
                                 suppress_warnings = TRUE,
@@ -278,6 +289,8 @@ impute_missing_data <- function(data,
   
   test_for_impute <- NULL
   if (!is.null(test_data)) {
+    missing_cols <- setdiff(names(train_for_impute), names(test_data))
+    for (mc in missing_cols) test_data[[mc]] <- NA
     test_for_impute <- test_data[, names(train_for_impute), drop = FALSE]
   }
   
@@ -310,8 +323,8 @@ impute_missing_data <- function(data,
     } else if (is.factor(x)) {
       methods[nm] <- if (nlevels(x) == 2) binary_factor_method else multiclass_factor_method
     } else if (is.logical(x)) {
-      train_for_impute[[nm]] <- factor(x)
-      if (!is.null(test_for_impute)) test_for_impute[[nm]] <- factor(test_for_impute[[nm]])
+      train_for_impute[[nm]] <- factor(x, levels = c("FALSE", "TRUE"))
+      if (!is.null(test_for_impute)) test_for_impute[[nm]] <- factor(test_for_impute[[nm]], levels = c("FALSE", "TRUE"))
       methods[nm] <- binary_factor_method
     } else {
       methods[nm] <- ""
@@ -342,59 +355,28 @@ impute_missing_data <- function(data,
   
   mids <- try({
     if (parallel) {
-      if (exists("futuremice", where = asNamespace("mice"), inherits = FALSE) &&
-          requireNamespace("future", quietly = TRUE)) {
-        
-        old_plan <- future::plan()
-        on.exit(future::plan(old_plan), add = TRUE)
-        future::plan(future::multisession, workers = ncores)
-        
-        with_default_contrasts({
-          mice::futuremice(
-            combined,
-            m = m,
-            maxit = maxit,
-            method = methods,
-            predictorMatrix = pred,
-            ignore = ignore,
-            parallelseed = seed,
-            n.core = ncores,
-            printFlag = FALSE
-          )
-        })
-        
-      } else {
-        if (!exists("parlmice", where = asNamespace("mice"), inherits = FALSE)) {
-          stop("mice::parlmice not available in this mice version.")
-        }
-        
-        cl <- parallel::makeCluster(ncores)
-        on.exit(try(suppressWarnings(parallel::stopCluster(cl)), silent = TRUE), add = TRUE)
-        
-        parallel::clusterEvalQ(cl, {
-          library(mice)
-          if (!exists("contr.ltfr", mode = "function")) {
-            contr.ltfr <- function(n, contrasts = TRUE, sparse = FALSE) {
-              stats::contr.treatment(n, contrasts = contrasts, sparse = sparse)
-            }
-          }
-          options(contrasts = c(unordered = "contr.treatment", ordered = "contr.poly"))
-        })
-        
-        with_default_contrasts({
-          mice::parlmice(
-            combined,
-            m = m,
-            maxit = maxit,
-            method = methods,
-            predictorMatrix = pred,
-            ignore = ignore,
-            seed = seed,
-            printFlag = FALSE,
-            cluster = cl
-          )
-        })
+      if (!exists("futuremice", where = asNamespace("mice"), inherits = FALSE) ||
+          !requireNamespace("future", quietly = TRUE)) {
+        stop("Parallel imputation requires mice::futuremice (modern mice >= 3.14) and the 'future' package.")
       }
+      
+      old_plan <- future::plan()
+      on.exit(future::plan(old_plan), add = TRUE)
+      future::plan(future::multisession, workers = ncores)
+      
+      with_default_contrasts({
+        mice::futuremice(
+          combined,
+          m = m,
+          maxit = maxit,
+          method = methods,
+          predictorMatrix = pred,
+          ignore = ignore,
+          parallelseed = seed,
+          n.core = ncores,
+          printFlag = FALSE
+        )
+      })
     } else {
       with_default_contrasts({
         if (suppress_warnings) {
@@ -547,7 +529,7 @@ fit_one_hot_encoder <- function(data, outcome_var, fullRank = FALSE) {
     data <- data[, setdiff(names(data), drop_cols), drop = FALSE]
   }
   
-  formula <- stats::as.formula(paste("~ . -", outcome_var))
+  formula <- stats::as.formula(paste0("~ . -`", outcome_var, "`"))
   dummy_model <- with_default_contrasts(
     caret::dummyVars(formula, data = data, fullRank = fullRank)
   )
@@ -630,12 +612,12 @@ apply_outlier_removal <- function(data, thresholds) {
 }
 
 ### ============================================================
-### 5. Generate Interaction Terms
+### 5. Interaction Terms (fit-then-apply)
 ### ============================================================
-generate_interaction_terms <- function(data, degree = 2,
-                                       exclude_cols = NULL,
-                                       include_binary = FALSE,
-                                       max_numeric_cols = 50L) {
+fit_interactions <- function(data, degree = 2,
+                             exclude_cols = NULL,
+                             include_binary = FALSE,
+                             max_numeric_cols = 50L) {
   assert_df(data, "data")
   if (degree != 2) stop("Only pairwise (degree = 2) interactions are supported.")
   exclude_cols <- exclude_cols %||% character(0)
@@ -647,7 +629,9 @@ generate_interaction_terms <- function(data, degree = 2,
     numeric_cols <- numeric_cols[!vapply(data[, numeric_cols, drop = FALSE], is_binary_numeric, logical(1))]
   }
   
-  if (length(numeric_cols) < 2) return(data)
+  if (length(numeric_cols) < 2) {
+    return(list(degree = degree, pairs = list()))
+  }
   
   if (length(numeric_cols) > max_numeric_cols) {
     log_warn("Too many numeric columns for interactions (%d). Using first %d.",
@@ -655,13 +639,29 @@ generate_interaction_terms <- function(data, degree = 2,
     numeric_cols <- numeric_cols[seq_len(max_numeric_cols)]
   }
   
-  interactions <- list()
+  pairs <- list()
   n <- length(numeric_cols)
   for (i in 1:(n - 1)) {
     for (j in (i + 1):n) {
-      new_col_name <- paste(numeric_cols[i], numeric_cols[j], sep = "_x_")
-      interactions[[new_col_name]] <- data[[numeric_cols[i]]] * data[[numeric_cols[j]]]
+      pairs[[length(pairs) + 1L]] <- c(numeric_cols[i], numeric_cols[j])
     }
+  }
+  
+  list(degree = degree, pairs = pairs)
+}
+
+apply_interactions <- function(data, interactions_fit) {
+  assert_df(data, "data")
+  if (is.null(interactions_fit) || !length(interactions_fit$pairs)) return(data)
+  
+  interactions <- list()
+  for (pr in interactions_fit$pairs) {
+    a <- pr[1]; b <- pr[2]
+    if (!(a %in% names(data)) || !(b %in% names(data))) {
+      stop(sprintf("apply_interactions: missing columns for pair %s_x_%s", a, b))
+    }
+    new_col_name <- paste(a, b, sep = "_x_")
+    interactions[[new_col_name]] <- data[[a]] * data[[b]]
   }
   
   cbind(data, as.data.frame(interactions))
@@ -712,7 +712,7 @@ select_features_ranger <- function(train, outcome_var,
   predictors <- setdiff(names(train), outcome_var)
   if (!length(predictors)) return(character(0))
   
-  form <- stats::as.formula(paste(outcome_var, "~", paste(predictors, collapse = " + ")))
+  form <- stats::as.formula(paste0("`", outcome_var, "` ~ ", paste0("`", predictors, "`", collapse = " + ")))
   
   set.seed(seed)
   rf <- with_default_contrasts(
@@ -739,7 +739,7 @@ select_features_boruta <- function(train, outcome_var,
   if (!outcome_var %in% names(train)) stop("outcome_var not found in train")
   
   set.seed(seed)
-  form <- stats::as.formula(paste(outcome_var, "~ ."))
+  form <- stats::as.formula(paste0("`", outcome_var, "` ~ ."))
   
   b <- with_default_contrasts(
     Boruta::Boruta(form, data = train, doTrace = 0, maxRuns = maxRuns)
@@ -785,11 +785,11 @@ select_features_lasso <- function(train, outcome_var,
   lambda <- if (lambda_choice == "lambda.1se") cv$lambda.1se else cv$lambda.min
   
   if (family == "multinomial") {
-    coefs <- glmnet::coef.glmnet(cv$glmnet.fit, s = lambda)
+    coefs <- coef(cv, s = lambda)
     nz <- unique(unlist(lapply(coefs, function(m) rownames(m)[as.numeric(m) != 0])))
     nz <- setdiff(nz, "(Intercept)")
   } else {
-    coefs <- glmnet::coef.glmnet(cv$glmnet.fit, s = lambda)
+    coefs <- coef(cv, s = lambda)
     nz <- rownames(coefs)[as.numeric(coefs) != 0]
     nz <- setdiff(nz, "(Intercept)")
   }
@@ -848,14 +848,8 @@ apply_transformations <- function(data, preproc_params) {
     data <- apply_scaler(data, preproc_params$scaler)
   }
   
-  if (!is.null(preproc_params$interaction_degree) && preproc_params$interaction_degree > 1) {
-    data <- generate_interaction_terms(
-      data,
-      degree = preproc_params$interaction_degree,
-      exclude_cols = outcome_var,
-      include_binary = isTRUE(preproc_params$interactions_include_binary %||% FALSE),
-      max_numeric_cols = preproc_params$interactions_max_numeric_cols %||% 50L
-    )
+  if (!is.null(preproc_params$interactions_fit)) {
+    data <- apply_interactions(data, preproc_params$interactions_fit)
   }
   
   if (!is.null(preproc_params$custom_transform) && is.function(preproc_params$custom_transform)) {
@@ -890,7 +884,7 @@ preprocess_data <- function(data,
                             numeric_impute_method = "pmm",
                             binary_factor_impute_method = "logreg",
                             multiclass_factor_impute_method = "polyreg",
-                            m = 5,
+                            m = 1,
                             maxit = 20,
                             seed = 500,
                             one_hot_fullRank = FALSE,
@@ -971,21 +965,17 @@ preprocess_data <- function(data,
     test  <- apply_scaler(test,  scaler)
   }
   
+  interactions_fit <- NULL
   if (!is.null(interaction_degree) && interaction_degree > 1) {
-    train <- generate_interaction_terms(
+    interactions_fit <- fit_interactions(
       train,
       degree = interaction_degree,
       exclude_cols = outcome_var,
       include_binary = interactions_include_binary,
       max_numeric_cols = interactions_max_numeric_cols
     )
-    test <- generate_interaction_terms(
-      test,
-      degree = interaction_degree,
-      exclude_cols = outcome_var,
-      include_binary = interactions_include_binary,
-      max_numeric_cols = interactions_max_numeric_cols
-    )
+    train <- apply_interactions(train, interactions_fit)
+    test  <- apply_interactions(test,  interactions_fit)
   }
   
   if (!is.null(custom_transform) && is.function(custom_transform)) {
@@ -1042,9 +1032,7 @@ preprocess_data <- function(data,
     dummy_model = dummy_model,
     nzv_fit = nzv_fit,
     scaler = scaler,
-    interaction_degree = interaction_degree,
-    interactions_include_binary = interactions_include_binary,
-    interactions_max_numeric_cols = interactions_max_numeric_cols,
+    interactions_fit = interactions_fit,
     custom_transform = custom_transform,
     selected_features = selected_features,
     seed = seed
@@ -1337,7 +1325,7 @@ uat_check_functions_exist <- function() {
     "fit_scaler", "apply_scaler",
     "fit_one_hot_encoder", "apply_one_hot_encoder",
     "fit_outlier_removal", "apply_outlier_removal",
-    "generate_interaction_terms"
+    "fit_interactions", "apply_interactions"
   )
   missing <- needed[!vapply(needed, exists, logical(1), mode = "function")]
   if (length(missing)) {
@@ -1651,6 +1639,11 @@ uat_run_reproducibility_smoke <- function() {
     uat_assert(identical(n1, n2), "repro:columns_identical",
                "Column names differ across identical runs",
                "Column names identical across identical runs")
+    uat_assert(isTRUE(all.equal(out1$value$train, out2$value$train,
+                                tolerance = .Machine$double.eps^0.5)),
+               "repro:values_identical",
+               "Numeric values differ across identical runs",
+               "Numeric values identical across identical runs")
   }
   
   invisible(TRUE)
@@ -1674,4 +1667,3 @@ uat_run_all <- function() {
 # Run this in RStudio:
 #   uat_run_all()
 ################################################################################
-
